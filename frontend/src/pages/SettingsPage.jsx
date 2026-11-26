@@ -272,6 +272,12 @@ export default function SettingsPage({ profile }) {
             <p className="mt-1 text-sm text-slate-600">
               Edit weights, thresholds, evidence requirements, and universal checks. The API validates the policy before saving.
             </p>
+            <p className="mt-1 text-sm text-slate-600">
+              Bank transfer review uses <code>bank_statement_scoring.staff_review_threshold_usd</code> (default 1000). For non-USD transactions, configure <code>staff_review_exchange_rates_to_usd</code> as USD per one currency unit; no exchange rate is inferred.
+            </p>
+            <p className="mt-1 text-sm text-slate-600">
+              Money In, Money Out, and low-balance flags are informational and never reduce the score. Only a completed “Source unverified” review deducts 0.50 points; confirmed and pending reviews do not. Legacy per-flag deduction settings are normalized to these rules.
+            </p>
             <textarea
               aria-label="Internal rules JSON"
               value={rulesText}

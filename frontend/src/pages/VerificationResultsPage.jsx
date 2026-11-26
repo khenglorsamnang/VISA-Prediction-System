@@ -3,14 +3,13 @@ import {
   ArrowLeft,
   CalendarDays,
   CheckCircle2,
+  ChevronDown,
   CircleCheck,
   CircleX,
   Clock3,
   Download,
-  FileCheck2,
   FileText,
   FolderOpen,
-  Grid2X2,
   Hourglass,
   Percent,
   Printer,
@@ -20,34 +19,30 @@ import {
 import { Link, useParams } from "react-router-dom";
 import { api } from "./pageUtils";
 import AbaBankPanel from "../components/AbaBankPanel";
-import EvidenceAssessmentPanel from "../components/EvidenceAssessmentPanel";
 import {
   AutomatedVerificationReport,
   BankStatementAnalysis,
   Metric,
 } from "../components/VerificationReportDetails";
 
-function receiptTime(value) {
-  if (!value) return "Issue time unavailable";
-  const timestamp = String(value);
-  const date = new Date(/(?:Z|[+-]\d{2}:\d{2})$/i.test(timestamp) ? timestamp : `${timestamp}Z`);
-  return Number.isNaN(date.getTime()) ? "Issue time unavailable" : `${date.toLocaleString("en-GB", { timeZone: "Asia/Phnom_Penh" })} (Asia/Phnom_Penh)`;
-}
-
 function isPhotoDocument(document) {
   return String(document.requirementCode || "").toLowerCase().includes("photo");
 }
 
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+
 export default function VerificationResultsPage({ profile = {} }) {
   const { applicationId } = useParams();
   const [results, setResults] = useState(null);
-  const [previews, setPreviews] = useState({});
-  const [previewErrors, setPreviewErrors] = useState({});
-  const [selectedPreviewId, setSelectedPreviewId] = useState("");
-  const [qrCode, setQrCode] = useState("");
-  const [comments, setComments] = useState("");
-  const [finalStatus, setFinalStatus] = useState("VERIFIED");
-  const [reportType, setReportType] = useState("EVIDENCE_ASSESSMENT");
+  const [documentThumbnails, setDocumentThumbnails] = useState({});
+  const [selectedDocumentId, setSelectedDocumentId] = useState("");
+  const [documentPdfPreview, setDocumentPdfPreview] = useState({ documentId: "", url: "", error: "" });
+  const [isDocumentPreviewOpen, setIsDocumentPreviewOpen] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -58,6 +53,12 @@ export default function VerificationResultsPage({ profile = {} }) {
     const response = await api.get(`/verification/results/${applicationId}`);
     setResults(response.data);
   };
+  const selectedDocument = results?.documents?.find(
+    (item) => item.documentId === selectedDocumentId,
+  ) || results?.documents?.[0];
+  const selectedDocumentContentUrl = selectedDocument?.contentUrl;
+  const selectedDocumentMimeType = selectedDocument?.mimeType;
+  const selectedDocumentPreviewId = selectedDocument?.documentId;
 
   useEffect(() => {
     let active = true;
@@ -107,7 +108,7 @@ export default function VerificationResultsPage({ profile = {} }) {
     let active = true;
     const objectUrls = [];
     Promise.all(
-      results.documents.map(async (document) => {
+      results.documents.filter((document) => document.mimeType?.startsWith("image/")).map(async (document) => {
         try {
           const response = await api.get(document.contentUrl, {
             responseType: "blob",
@@ -121,17 +122,7 @@ export default function VerificationResultsPage({ profile = {} }) {
       }),
     ).then((items) => {
       if (!active) return;
-      setPreviews(Object.fromEntries(items));
-      setPreviewErrors(
-        Object.fromEntries(
-          items
-            .filter(([, url]) => !url)
-            .map(([id]) => [
-              id,
-              "Preview unavailable. Use the authorized download link.",
-            ]),
-        ),
-      );
+      setDocumentThumbnails(Object.fromEntries(items));
     });
     return () => {
       active = false;
@@ -140,66 +131,43 @@ export default function VerificationResultsPage({ profile = {} }) {
   }, [results]);
 
   useEffect(() => {
-    let active = true;
-    if (!results?.receiptNumber) {
-      return () => {
-        active = false;
-      };
+    if (
+      selectedDocumentMimeType !== "application/pdf"
+      || !selectedDocumentPreviewId
+      || !selectedDocumentContentUrl
+    ) {
+      return undefined;
     }
-    api
-      .get(`/verification/receipts/${results.receiptNumber}`)
+
+    const controller = new AbortController();
+    let objectUrl = "";
+    api.get(selectedDocumentContentUrl, {
+      responseType: "blob",
+      signal: controller.signal,
+    })
       .then((response) => {
-        if (active) setQrCode(response.data.qrCodeDataUrl || "");
+        objectUrl = URL.createObjectURL(response.data);
+        setDocumentPdfPreview({ documentId: selectedDocumentPreviewId, url: objectUrl, error: "" });
       })
-      .catch(() => {
-        if (active) setQrCode("");
+      .catch((requestError) => {
+        if (!controller.signal.aborted) {
+          setDocumentPdfPreview({
+            documentId: selectedDocumentPreviewId,
+            url: "",
+            error: requestError?.response?.data?.message || "Document preview could not be loaded.",
+          });
+        }
       });
+
     return () => {
-      active = false;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [results?.receiptNumber]);
-
-  const runPrediction = async () => {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api.post(`/verification/${applicationId}/predict`);
-      await loadResults();
-      setNotice(
-        "Prediction updated. Any estimate shown is not a visa decision.",
-      );
-    } catch (requestError) {
-      setError(
-        requestError?.response?.data?.message || "Unable to run prediction.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const finalize = async (event) => {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api.post(`/verification/${applicationId}/finalize`, {
-        status: finalStatus,
-        reportType,
-        comments,
-      });
-      await loadResults();
-      setNotice("Verification completed and receipt generated.");
-    } catch (requestError) {
-      setError(
-        requestError?.response?.data?.message ||
-          "Unable to finalize verification.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
+  }, [
+    selectedDocumentPreviewId,
+    selectedDocumentContentUrl,
+    selectedDocumentMimeType,
+  ]);
 
   const downloadReceiptNumber = async (number) => {
     if (typeof number !== "string" || !number.trim()) return;
@@ -296,13 +264,11 @@ export default function VerificationResultsPage({ profile = {} }) {
   const bankRequirementScores = Object.fromEntries(
     (summary.bankStatementScore || []).map((item) => [item.documentId, item]),
   );
-  const prediction = results.prediction || { status: "UNAVAILABLE" };
   const documents = results.documents || [];
   const latestVerification = results.latestVerification;
   const report = results.verificationReport || {};
   const receiptNumber = results.receiptNumber;
   const finalized = Boolean(receiptNumber) && results.receiptIsCurrent !== false;
-  const needsRefinalization = Boolean(results.assessmentNeedsRefinalization);
   const reportStatus = finalized
     ? report.finalStatus || application.status || "RECORDED"
     : summary.automatedVerificationStatus || "INSUFFICIENT_DATA";
@@ -312,9 +278,6 @@ export default function VerificationResultsPage({ profile = {} }) {
       : reportStatus === "REJECTED"
         ? "border-red-200 bg-red-50 text-red-800"
         : "border-amber-200 bg-amber-50 text-amber-900";
-  const selectedDocument =
-    documents.find((item) => item.documentId === selectedPreviewId) ||
-    documents[0];
   const allChecks = documents.flatMap((item) =>
     (item.automatedVerification?.checks || []).map((check) => ({
       ...check,
@@ -339,7 +302,246 @@ export default function VerificationResultsPage({ profile = {} }) {
   const totalPages = summary.ocrProgress?.totalPages ?? 0;
   const processedPages = summary.ocrProgress?.pagesProcessed ?? 0;
   const reportDate = latestVerification?.createdAt || application.createdAt;
-  const pdfAction = finalized ? downloadReceipt : () => window.print();
+  const printReport = () => {
+    const invoiceReference =
+      receiptNumber ||
+      application.applicationNumber ||
+      `INV-${String(applicationId || "").slice(-8).toUpperCase()}`;
+    const issueDate = reportDate
+      ? new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "2-digit" }).format(new Date(reportDate))
+      : "Not recorded";
+    const dueDate = reportDate
+      ? new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "2-digit" }).format(
+          new Date(new Date(reportDate).getTime() + 7 * 86400000),
+        )
+      : "Not recorded";
+    const verificationPercent = Math.round(Number(summary.documentReadiness ?? summary.verificationPercentage ?? 0));
+    const verificationStatus = reportStatus === "VERIFIED" ? "Verified" : "Pending Review";
+    const verificationRows = requirementScores.length
+      ? requirementScores.map((item, index) => {
+          const status = statusMeta(item.status).label;
+          const score = `${item.earnedPoints ?? 0} / ${item.configuredPoints ?? 0}`;
+          return `<tr>
+            <td>${index + 1}</td>
+            <td>${escapeHtml(item.name || "Document")}</td>
+            <td><span class="${status === "Verified" ? "ok" : "pending"}">● ${escapeHtml(status)}</span></td>
+            <td>${escapeHtml(score)}</td>
+            <td>${status === "Verified" ? "Requirements complete" : "Needs review"}</td>
+          </tr>`;
+        }).join("")
+      : documents.map((item, index) => `<tr>
+          <td>${index + 1}</td>
+          <td>${escapeHtml(documentName(item))}</td>
+          <td><span class="${String(item.status).toUpperCase() === "VERIFIED" ? "ok" : "pending"}">● ${escapeHtml(statusMeta(item.status).label)}</span></td>
+          <td>${escapeHtml(`${item.awardedPoints ?? 0} / ${item.assignedPoints ?? 0}`)}</td>
+          <td>${escapeHtml(item.verificationComments || item.rejectionReason || "—")}</td>
+        </tr>`).join("");
+    const approved = reportStatus === "VERIFIED";
+    const printFrame = document.createElement("iframe");
+    printFrame.title = "Invoice print";
+    printFrame.setAttribute("aria-hidden", "true");
+    Object.assign(printFrame.style, {
+      position: "fixed",
+      width: "1px",
+      height: "1px",
+      right: "0",
+      bottom: "0",
+      border: "0",
+      opacity: "0",
+      pointerEvents: "none",
+    });
+    document.body.appendChild(printFrame);
+    const printDocument =
+      printFrame.contentDocument || printFrame.contentWindow?.document;
+    if (!printDocument) {
+      printFrame.remove();
+      setError("Unable to prepare the invoice for printing.");
+      return;
+    }
+    printDocument.open();
+    printDocument.write(`<!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>${escapeHtml(invoiceReference)}</title>
+          <style>
+            @page { size: A4; margin: 8mm; }
+            * { box-sizing: border-box; }
+            body { margin: 0; color: #26344d; font-family: Arial, sans-serif; font-size: 10px; background: #fff; }
+            .sheet { width: 100%; height: 277mm; overflow: hidden; border: 1px solid #dfe7f5; }
+            .top { position: relative; height: 118px; overflow: hidden; border-bottom: 1px solid #dbe7ff; background: linear-gradient(135deg, #eef6ff 0%, #fff 58%, #eef5ff 100%); }
+            .top:before { content: ""; position: absolute; width: 290px; height: 90px; right: -70px; top: -58px; border: 12px solid #b9d5fb; border-radius: 0 0 0 180px; transform: rotate(-8deg); }
+            .top:after { content: ""; position: absolute; width: 260px; height: 40px; right: -50px; top: 18px; border-top: 9px solid #3b82d0; border-radius: 50%; transform: rotate(-12deg); }
+            .brand { position: absolute; z-index: 2; left: 22px; top: 20px; display: flex; align-items: center; gap: 12px; }
+            .logo { width: 72px; height: 72px; border-radius: 12px; object-fit: contain; background: #111a2d; }
+            .brand-text strong { display: block; color: #22569d; font-size: 27px; line-height: 1; }
+            .brand-text span { display: block; margin-top: 4px; color: #314a6b; font-size: 9px; }
+            .contact { position: absolute; z-index: 3; right: 22px; top: 26px; color: #315d96; font-size: 9px; line-height: 1.8; text-align: right; }
+            .contact strong { color: #173d70; }
+            .invoice-title { display: flex; height: 68px; align-items: center; justify-content: space-between; border-top: 1px solid #8ab0df; margin: 12px 22px 0; }
+            .title-left { display: flex; height: 48px; align-items: center; gap: 10px; border-radius: 8px; padding: 0 14px; color: #fff; background: #214f94; }
+            .title-icon { width: 27px; height: 31px; border: 2px solid #fff; border-radius: 4px; position: relative; }
+            .title-icon:before { content: ""; position: absolute; left: 5px; right: 5px; top: 8px; height: 2px; background: #fff; box-shadow: 0 6px #fff, 0 12px #fff; }
+            .title-left strong { display: block; font-size: 17px; letter-spacing: 1px; }
+            .title-left span { display: block; margin-top: 3px; font-size: 8px; }
+            .invoice-meta { text-align: right; color: #314a6b; font-size: 10px; line-height: 1.65; }
+            .invoice-meta strong { color: #173d70; }
+            .content { height: 180mm; display: flex; flex-direction: column; padding: 0 22px 16px; }
+            .applicant-row { display: grid; grid-template-columns: minmax(0, 1fr) 160px; gap: 12px; margin-top: 8px; }
+            .section { overflow: hidden; border: 1px solid #dde6f4; border-radius: 8px; }
+            .section-title { display: flex; height: 36px; align-items: center; gap: 8px; padding: 0 12px; color: #fff; background: linear-gradient(90deg, #1e4f9a, #2e67ad); font-size: 12px; font-weight: 800; }
+            .section-icon { width: 18px; height: 18px; border: 1px solid #fff; border-radius: 3px; position: relative; }
+            .app-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 12px; padding: 7px 10px 8px; }
+            .app-field { display: grid; grid-template-columns: 118px 1fr; min-height: 34px; align-items: center; border-bottom: 1px solid #edf1f7; }
+            .app-field:last-child, .app-field:nth-last-child(2) { border-bottom: 0; }
+            .app-field span { color: #35517a; font-size: 9px; }
+            .app-field strong { color: #26344d; font-size: 10px; }
+            .verification { display: grid; height: 100%; place-items: center; border: 1px solid #a8d6b5; border-radius: 8px; color: #1b9a55; background: #eaf8ef; text-align: center; }
+            .score-row { display: flex; align-items: center; justify-content: center; gap: 7px; }
+            .shield { width: 34px; height: 38px; border-radius: 4px 4px 12px 12px; color: #fff; background: #22a55a; clip-path: polygon(50% 0, 92% 16%, 82% 72%, 50% 100%, 18% 72%, 8% 16%); text-align: center; line-height: 38px; font-size: 16px; }
+            .verification strong { color: #159447; font-size: 30px; line-height: 1; }
+            .verification span { display: block; color: #2d5d47; font-size: 9px; }
+            .progress { width: 110px; height: 5px; overflow: hidden; border-radius: 99px; background: #dbe8df; margin: 6px auto 4px; }
+            .progress div { height: 100%; border-radius: 99px; background: #22a55a; }
+            .status { display: inline-block; border-radius: 4px; padding: 4px 7px; color: #fff; background: #1f9e57; font-size: 8px; font-weight: 800; }
+            .invoice-table { margin-top: 10px; border: 1px solid #bfcde0; border-radius: 8px; overflow: hidden; }
+            table { width: 100%; border-collapse: collapse; }
+            th { height: 36px; color: #314b70; background: #edf3fb; text-align: left; font-size: 10px; }
+            th:last-child, td:last-child { width: 150px; text-align: right; }
+            th:first-child, td:first-child { width: 35px; text-align: center; }
+            th:nth-child(2), td:nth-child(2) { text-align: left; }
+            td { height: 38px; border-bottom: 1px solid #edf1f7; color: #26344d; font-size: 10px; }
+            tr:last-child td { border-bottom: 0; }
+            .summary td { height: 24px; border: 0; background: #f7faff; font-weight: 800; }
+            .summary .total-label, .summary .total-value { color: #2153a1; background: #eaf1ff; font-size: 11px; }
+            .bottom-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+            .payment-grid { display: grid; grid-template-columns: 118px 1fr; gap: 0 8px; padding: 7px 10px; }
+            .payment-grid span { color: #35517a; font-size: 9px; }
+            .payment-grid strong { color: #26344d; font-size: 10px; }
+            .terms { padding: 7px 10px 5px; }
+            .terms ol { margin: 0; padding-left: 17px; color: #3e4c60; font-size: 8.5px; line-height: 1.65; }
+            .footer { display: flex; height: 82px; align-items: flex-end; justify-content: space-between; margin-top: auto; border-bottom: 1px solid #2d63a7; }
+            .qr { width: 55px; height: 55px; border: 5px solid #17213a; box-shadow: inset 0 0 0 3px #fff; background: repeating-linear-gradient(90deg,#17213a 0 4px,#fff 4px 8px,#17213a 8px 10px,#fff 10px 14px); }
+            .thank-you { color: #314a6b; text-align: center; font-size: 9px; font-style: italic; }
+            .thank-you strong { display: block; color: #1f568e; }
+            .signature { width: 150px; color: #315d96; text-align: right; font-size: 7px; }
+            .signature-line { height: 28px; border-bottom: 1px solid #8da0ba; font-size: 9px; }
+            .agency-name { color: #26344d; font-size: 8px; font-weight: 800; }
+            @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+          </style>
+        </head>
+        <body>
+          <main class="sheet">
+            <header class="top">
+              <div class="brand">
+                <img class="logo" src="/global-eagle-logo.jpg" alt="GLOBAL EAGLE" />
+                <div class="brand-text">
+                  <strong>GLOBAL EAGLE</strong>
+                  <span>Visa Application &amp; Document Processing Services</span>
+                  <span><b>Your Trusted Visa Service Partner</b></span>
+                </div>
+              </div>
+              <div class="contact">
+                <strong>☎ &nbsp; +855 23 999 999</strong><br />
+                <strong>✉ &nbsp; info@visadoc.ai</strong><br />
+                <strong>⌖ &nbsp; Phnom Penh, Cambodia</strong>
+              </div>
+            </header>
+
+            <div class="invoice-title">
+              <div class="title-left">
+                <span class="title-icon"></span>
+                <div><strong>VISA INVOICE</strong><span>Visa Application Assessment Report</span></div>
+              </div>
+              <div class="invoice-meta">
+                <div><strong>Invoice No:</strong> ${escapeHtml(invoiceReference)}</div>
+                <div><strong>Issue Date:</strong> ${escapeHtml(issueDate)}</div>
+                <div><strong>Due Date:</strong> ${escapeHtml(dueDate)}</div>
+              </div>
+            </div>
+
+            <div class="content">
+              <div class="applicant-row">
+                <section class="section">
+                  <div class="section-title"><span class="section-icon"></span> Applicant Information</div>
+                  <div class="app-grid">
+                    <div class="app-field"><span>Applicant Name</span><strong>: ${escapeHtml(applicant.fullName || "—")}</strong></div>
+                    <div class="app-field"><span>Destination Country</span><strong>: ${escapeHtml(application.destination || "—")}</strong></div>
+                    <div class="app-field"><span>Passport Number</span><strong>: ${escapeHtml(applicant.passportNumber || "—")}</strong></div>
+                    <div class="app-field"><span>Visa Type</span><strong>: ${escapeHtml(application.visaTypeName || "—")}</strong></div>
+                    <div class="app-field"><span>Nationality</span><strong>: ${escapeHtml(applicant.nationality || "—")}</strong></div>
+                    <div class="app-field"><span>Application ID</span><strong>: ${escapeHtml(application.applicationNumber || application.id || "—")}</strong></div>
+                  </div>
+                </section>
+                <section class="verification">
+                  <div>
+                    <div class="score-row"><span class="shield">✓</span><strong>${Math.round(verificationPercent)}%</strong></div>
+                    <span>Document Verified</span>
+                    <div class="progress"><div style="width:${Math.max(0, Math.min(100, verificationPercent))}%"></div></div>
+                    <div class="status">✓ ${escapeHtml(approved ? "APPROVED FOR REVIEW" : verificationStatus.toUpperCase())}</div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="invoice-table">
+                <div class="section-title"><span class="section-icon"></span> Verification Details</div>
+                <table>
+                  <thead><tr><th>#</th><th>Document Type</th><th>Status</th><th>Score</th><th>Remarks</th></tr></thead>
+                  <tbody>${verificationRows}</tbody>
+                </table>
+              </section>
+
+              <div class="bottom-row">
+                <section class="section">
+                  <div class="section-title"><span class="section-icon"></span> Payment Information</div>
+                  <div class="payment-grid">
+                    <span>Payment Method</span><strong>: Not recorded</strong>
+                    <span>Payment Status</span><strong>: ${escapeHtml(finalized ? "Paid" : "Unpaid")}</strong>
+                    <span>Amount Paid</span><strong>: Not recorded</strong>
+                    <span>Balance Due</span><strong>: Not recorded</strong>
+                  </div>
+                </section>
+                <section class="section">
+                  <div class="section-title"><span class="section-icon"></span> Terms &amp; Conditions</div>
+                  <div class="terms">
+                    <ol>
+                      <li>Payment must be made by the due date stated above.</li>
+                      <li>Government visa fees are subject to the applicable embassy or immigration authority.</li>
+                      <li>Service fees are separate from government visa fees.</li>
+                      <li>Visa approval is determined solely by the relevant immigration authority. Payment does not guarantee visa approval.</li>
+                      <li>Refunds are subject to the applicable service agreement and refund policy.</li>
+                    </ol>
+                  </div>
+                </section>
+              </div>
+
+              <footer class="footer">
+                <div class="qr"></div>
+                <div class="thank-you"><strong>Thank you for choosing GLOBAL EAGLE</strong><span>Visa Application &amp; Document Processing</span></div>
+                <div class="signature">
+                  <div class="signature-line"></div>
+                  <div class="agency-name">Authorized Signature</div>
+                  <div>GLOBAL EAGLE</div>
+                </div>
+              </footer>
+            </div>
+          </main>
+        </body>
+      </html>`);
+    printDocument.close();
+    const printWindow = printFrame.contentWindow;
+    if (!printWindow) {
+      printFrame.remove();
+      setError("Unable to prepare the invoice for printing.");
+      return;
+    }
+    window.setTimeout(() => {
+      printWindow.focus();
+      printWindow.print();
+      window.setTimeout(() => printFrame.remove(), 1000);
+    }, 250);
+  };
+  const pdfAction = printReport;
   const bankDocuments = documents.filter((item) => item.bankStatementAnalysis);
   const requirementScores = summary.requirementScores || [];
   const requirementById = Object.fromEntries(
@@ -383,10 +585,29 @@ export default function VerificationResultsPage({ profile = {} }) {
       border: "border-amber-200",
     };
   };
-  const allChecksCompleted =
-    requirementScores.length > 0 &&
-    requirementScores.every((item) => item.status === "VERIFIED");
-
+  const verificationSummaryMetrics = [
+    {
+      label: "Required documents verified",
+      value: `${summary.verificationPercentage ?? 0}%`,
+    },
+    {
+      label: "Document readiness",
+      value: `${summary.documentReadiness ?? 0}%`,
+    },
+    {
+      label: "Earned document points",
+      value: `${summary.earnedPoints ?? 0} / ${summary.maximumPoints ?? 0}`,
+    },
+    {
+      label: "OCR page progress",
+      value: `${summary.ocrProgress?.percentage ?? 0}%`,
+      detail: `${processedPages} of ${totalPages} pages processed`,
+    },
+    {
+      label: "Missing required documents",
+      value: summary.missingRequiredDocuments?.length ?? 0,
+    },
+  ];
   return (
     <main className="verification-report mx-auto max-w-[1500px] space-y-5">
       <header className="verification-hero flex flex-wrap items-center justify-between gap-3">
@@ -420,11 +641,11 @@ export default function VerificationResultsPage({ profile = {} }) {
             className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-800"
           >
             <Download className="h-4 w-4" aria-hidden="true" />{" "}
-            {finalized ? "Download report PDF" : "Print / Save PDF"}
+            Print / Save PDF
           </button>
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={printReport}
             className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
           >
             <Printer className="h-4 w-4" aria-hidden="true" /> Print
@@ -448,8 +669,6 @@ export default function VerificationResultsPage({ profile = {} }) {
           {notice}
         </p>
       )}
-
-      <EvidenceAssessmentPanel results={results} applicationId={applicationId} canManage={canManage} onChange={loadResults} />
 
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         {[
@@ -512,7 +731,7 @@ export default function VerificationResultsPage({ profile = {} }) {
         ))}
       </section>
 
-      <section className="grid gap-4 xl:grid-cols-[1.05fr_1fr]">
+      <section>
         <article className="verification-panel overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
             <div>
@@ -520,10 +739,6 @@ export default function VerificationResultsPage({ profile = {} }) {
                 <FolderOpen className="h-5 w-5 text-blue-700" /> Document list
               </h2>
               <p className="mt-1 text-xs text-slate-500">Uploaded files and their current verification state</p>
-            </div>
-            <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 text-xs font-semibold text-slate-600">
-              <span className="rounded-md bg-white px-2 py-1 text-blue-700 shadow-sm"><FileText className="mr-1 inline h-3.5 w-3.5" />List</span>
-              <span className="px-2 py-1"><Grid2X2 className="mr-1 inline h-3.5 w-3.5" />Grid</span>
             </div>
           </div>
           <div className="divide-y divide-slate-100">
@@ -535,62 +750,90 @@ export default function VerificationResultsPage({ profile = {} }) {
                 <button
                   type="button"
                   key={item.documentId}
-                  onClick={() => setSelectedPreviewId(item.documentId)}
-                  className={`verification-document-row flex w-full items-center gap-3 p-4 text-left transition hover:bg-blue-50/50 ${selected ? "bg-blue-50/50" : ""} ${meta.label === "Verified" ? "is-verified" : meta.label === "Rejected" ? "is-rejected" : "is-pending"}`}
+                  aria-pressed={selected}
+                  onClick={() => {
+                    setSelectedDocumentId(item.documentId);
+                    setIsDocumentPreviewOpen(true);
+                  }}
+                  className={`verification-document-row flex w-full items-center gap-3 p-4 text-left transition ${selected ? "bg-blue-50/50" : "hover:bg-blue-50/50"} ${meta.label === "Verified" ? "is-verified" : meta.label === "Rejected" ? "is-rejected" : "is-pending"}`}
                 >
-                  {previews[item.documentId] && item.mimeType?.startsWith("image/") ? (
-                    <img src={previews[item.documentId]} alt="" className="h-14 w-16 rounded-lg border border-slate-200 object-cover" />
+                  {documentThumbnails[item.documentId] ? (
+                    <img src={documentThumbnails[item.documentId]} alt="" className="h-14 w-16 rounded-lg border border-slate-200 object-cover" />
                   ) : (
                     <span className="flex h-14 w-16 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-700"><FileText className="h-7 w-7" /></span>
                   )}
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-sm font-bold text-slate-900">{documentName(item)}</span>
                     <span className="mt-1 block truncate text-xs text-slate-500">{item.fileName}</span>
-                    <span className="mt-1 block text-[11px] text-slate-400">Uploaded {item.uploadDate ? new Date(item.uploadDate).toLocaleString() : "—"}</span>
+                    {item.uploadDate && <span className="mt-1 block text-[11px] text-slate-400">Uploaded {new Date(item.uploadDate).toLocaleDateString()}</span>}
                   </span>
                   <span className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs font-bold ${meta.badge}`}>
                     <StatusIcon className="h-3.5 w-3.5" /> {meta.label}
                   </span>
-                  <Eye className="h-4 w-4 shrink-0 text-blue-600" />
                 </button>
               );
             }) : (
               <p className="p-6 text-sm text-slate-500">No documents uploaded.</p>
             )}
           </div>
+          {selectedDocument && (
+            <div className="border-t border-slate-100">
+              <button
+                type="button"
+                aria-expanded={isDocumentPreviewOpen}
+                aria-controls="document-preview-content"
+                onClick={() => setIsDocumentPreviewOpen((open) => !open)}
+                className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-bold text-slate-900 hover:bg-slate-50"
+              >
+                <span className="flex items-center gap-2">
+                  <Eye className="h-4 w-4 text-blue-700" />
+                  Document preview
+                </span>
+                <ChevronDown className={`h-4 w-4 text-slate-500 transition-transform ${isDocumentPreviewOpen ? "rotate-180" : ""}`} />
+              </button>
+              <div
+                id="document-preview-content"
+                hidden={!isDocumentPreviewOpen}
+                aria-hidden={!isDocumentPreviewOpen}
+                style={{ display: isDocumentPreviewOpen ? "flex" : "none" }}
+                className="flex min-h-[300px] items-center justify-center bg-slate-50 p-3"
+              >
+                {selectedDocument.mimeType?.startsWith("image/") ? (
+                  documentThumbnails[selectedDocument.documentId] ? (
+                    <img
+                      src={documentThumbnails[selectedDocument.documentId]}
+                      alt={selectedDocument.fileName}
+                      className="max-h-[420px] max-w-full object-contain"
+                    />
+                  ) : Object.prototype.hasOwnProperty.call(documentThumbnails, selectedDocument.documentId) ? (
+                    <p className="text-sm text-slate-500">Image preview could not be loaded.</p>
+                  ) : (
+                    <p className="text-sm text-slate-500">Loading document…</p>
+                  )
+                ) : selectedDocument.mimeType === "application/pdf" ? (
+                  documentPdfPreview.documentId === selectedDocument.documentId && documentPdfPreview.url ? (
+                    <iframe
+                      title={selectedDocument.fileName}
+                      src={documentPdfPreview.url}
+                      className="h-[420px] w-full rounded-lg bg-white"
+                    />
+                  ) : (
+                    <p className="text-sm text-slate-500">
+                      {documentPdfPreview.documentId === selectedDocument.documentId && documentPdfPreview.error
+                        ? documentPdfPreview.error
+                        : "Loading document…"}
+                    </p>
+                  )
+                ) : (
+                  <p className="text-sm text-slate-500">
+                    Preview is not available for this file type.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
         </article>
 
-        <article className="verification-panel overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-          <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-            <div>
-              <h2 className="flex items-center gap-2 text-base font-bold text-slate-900">
-                <CheckCircle2 className="h-5 w-5 text-blue-700" /> Verification checklist
-              </h2>
-              <p className="mt-1 text-xs text-slate-500">Configured checks for this visa type</p>
-            </div>
-            <span className={`rounded-full px-3 py-1 text-xs font-bold ${allChecksCompleted ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-              {allChecksCompleted ? "All checks completed" : "Review required"}
-            </span>
-          </div>
-          <div className="divide-y divide-slate-100">
-            {requirementScores.length ? requirementScores.map((item) => {
-              const meta = statusMeta(item.status);
-              const StatusIcon = meta.icon;
-              return (
-                <div key={item.requirementId} className="verification-check-row flex items-center gap-3 px-5 py-3">
-                  <span className={`flex h-8 w-8 items-center justify-center rounded-full ${meta.badge}`}><StatusIcon className="h-4 w-4" /></span>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-bold text-slate-900">{item.name}</p>
-                    <p className="mt-0.5 text-xs text-slate-500">{item.required ? "Required" : "Optional"} · {item.earnedPoints ?? 0}/{item.configuredPoints ?? 0} points</p>
-                  </div>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${meta.badge}`}>{meta.label}</span>
-                </div>
-              );
-            }) : (
-              <p className="p-6 text-sm text-slate-500">No configured requirement results are available.</p>
-            )}
-          </div>
-        </article>
       </section>
 
       <section className="hidden grid gap-4 xl:grid-cols-[1.65fr_1fr]">
@@ -716,80 +959,7 @@ export default function VerificationResultsPage({ profile = {} }) {
         finalized.
       </p>
 
-      <section className="grid gap-4 xl:grid-cols-[1fr_1.2fr]">
-        <article className="verification-panel overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-          <div className="flex items-center gap-2 border-b border-slate-100 bg-white px-4 py-3 text-sm font-bold text-slate-900">
-            <Eye className="h-4 w-4 text-blue-700" />
-            Document preview
-          </div>
-          {documents.length ? (
-            <>
-              <div className="flex gap-1 overflow-x-auto border-b border-slate-200 px-3 pt-2">
-                {documents.map((item) => (
-                  <button
-                    key={item.documentId}
-                    type="button"
-                    onClick={() => setSelectedPreviewId(item.documentId)}
-                    className={`shrink-0 border-b-2 px-3 py-2 text-xs font-semibold ${selectedDocument?.documentId === item.documentId ? "border-blue-700 text-blue-800" : "border-transparent text-slate-500 hover:text-slate-800"}`}
-                  >
-                    {item.requirementCode || item.fileName}
-                  </button>
-                ))}
-              </div>
-              <div className="flex min-h-[300px] items-center justify-center bg-slate-50 p-3">
-                {selectedDocument && previews[selectedDocument.documentId] ? (
-                  selectedDocument.mimeType === "application/pdf" ? (
-                    <iframe
-                      title={selectedDocument.fileName}
-                      src={previews[selectedDocument.documentId]}
-                      className="h-[340px] w-full rounded-lg bg-white"
-                    />
-                  ) : selectedDocument.mimeType?.startsWith("image/") ? (
-                    <img
-                      src={previews[selectedDocument.documentId]}
-                      alt={selectedDocument.fileName}
-                      className="max-h-[340px] max-w-full object-contain"
-                    />
-                  ) : (
-                    <p className="text-sm text-slate-500">
-                      Preview is not available for this file type.
-                    </p>
-                  )
-                ) : (
-                  <p className="text-sm text-slate-500">
-                    {selectedDocument &&
-                    previewErrors[selectedDocument.documentId]
-                      ? previewErrors[selectedDocument.documentId]
-                      : "Loading document preview…"}
-                  </p>
-                )}
-              </div>
-              {selectedDocument && (
-                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 p-3 text-xs">
-                  <span className="font-medium text-slate-700">
-                    {selectedDocument.fileName} · {selectedDocument.ocrStatus} ·{" "}
-                    {selectedDocument.pagesProcessed}/
-                    {selectedDocument.totalPages} pages
-                  </span>
-                  {previews[selectedDocument.documentId] && (
-                    <a
-                      href={previews[selectedDocument.documentId]}
-                      download={selectedDocument.fileName}
-                      className="font-semibold text-blue-700 underline"
-                    >
-                      Download original
-                    </a>
-                  )}
-                </div>
-              )}
-            </>
-          ) : (
-            <p className="p-8 text-center text-sm text-slate-500">
-              No documents uploaded.
-            </p>
-          )}
-        </article>
-
+      <section className="grid gap-4">
         <article className="verification-panel overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
           <div className="flex items-center justify-between border-b border-slate-100 bg-white px-4 py-3 text-sm font-bold text-slate-900">
             <span className="flex items-center gap-2"><CheckCircle2 className="h-4 w-4 text-blue-700" />
@@ -800,49 +970,26 @@ export default function VerificationResultsPage({ profile = {} }) {
           <div className="grid divide-y divide-slate-200 md:grid-cols-3 md:divide-x md:divide-y-0">
             <div className="p-4">
               <h3 className="text-sm font-bold text-slate-900">OCR results</h3>
-              <p className="mt-3 text-xs text-slate-600">
-                {summary.ocrCompletedDocuments ?? 0} of{" "}
-                {summary.totalDocuments ?? documents.length} documents processed
+              <p className="mt-2 text-sm font-semibold text-slate-800">
+                {summary.ocrCompletedDocuments ?? 0}/{summary.totalDocuments ?? documents.length} documents
               </p>
-              <p className="mt-1 text-xs text-slate-600">
-                Pages: {processedPages} / {totalPages}
-              </p>
-              <p className="mt-1 text-xs text-slate-600">
-                Processing:{" "}
-                {summary.documentProcessingStatus || "NOT AVAILABLE"}
-              </p>
+              <p className="mt-1 text-xs text-slate-600">{processedPages}/{totalPages} pages · {summary.documentProcessingStatus || "Status unavailable"}</p>
             </div>
             <div className="p-4">
               <h3 className="text-sm font-bold text-slate-900">Field checks</h3>
-              <p className="mt-3 text-xs text-slate-600">
-                Passed: {passedChecks.length} / {allChecks.length} available
-                checks
-              </p>
-              <p className="mt-1 text-xs text-slate-600">
-                Automated status:{" "}
-                {summary.automatedVerificationStatus || "INSUFFICIENT_DATA"}
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                Checks compare extracted fields and application data only.
-              </p>
+              <p className="mt-2 text-sm font-semibold text-slate-800">{passedChecks.length}/{allChecks.length} passed</p>
+              <p className="mt-1 text-xs text-slate-600">{summary.automatedVerificationStatus || "Status unavailable"}</p>
             </div>
             <div className="p-4">
               <h3 className="text-sm font-bold text-slate-900">Consistency</h3>
               {bankDocuments.length ? (
                 bankDocuments.map((item) => (
-                  <div
-                    key={item.documentId}
-                    className="mt-3 text-xs text-slate-600"
-                  >
-                    <p>{item.fileName}</p>
-                    <p className="mt-1">
-                      {item.abaStatementAnalysis ? "ABA review: " : "Legacy three-month diagnostic: "}
-                      {item.abaStatementAnalysis?.reviewStatus || item.bankStatementAnalysis.financialRequirementStatus || "INSUFFICIENT_DATA"}
-                    </p>
-                    <p>
-                      Reconciliation:{" "}
-                      {item.abaStatementAnalysis?.reconciliationStatus || item.bankStatementAnalysis.reconciliation?.status || "NOT_AVAILABLE"}
-                    </p>
+                  <div key={item.documentId} className="mt-2 text-xs text-slate-600">
+                    <p className="truncate">{item.fileName}</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <span className="rounded-full bg-slate-100 px-2 py-1">{item.abaStatementAnalysis?.reviewStatus || item.bankStatementAnalysis.financialRequirementStatus || "Status unavailable"}</span>
+                      <span className="rounded-full bg-slate-100 px-2 py-1">{item.abaStatementAnalysis?.reconciliationStatus || item.bankStatementAnalysis.reconciliation?.status || "Reconciliation unavailable"}</span>
+                    </div>
                   </div>
                 ))
               ) : (
@@ -853,95 +1000,65 @@ export default function VerificationResultsPage({ profile = {} }) {
             </div>
           </div>
           {unresolvedChecks.length > 0 && (
-            <div className="border-t border-amber-200 bg-amber-50 p-4">
-              <h3 className="text-sm font-bold text-amber-900">
-                Checks requiring review
-              </h3>
-              <ul className="mt-2 grid gap-2 text-xs text-amber-900 sm:grid-cols-2">
-                {unresolvedChecks.slice(0, 6).map((check, index) => (
+            <details className="border-t border-amber-200 bg-amber-50 p-4">
+              <summary className="cursor-pointer text-sm font-bold text-amber-900">
+                {unresolvedChecks.length} check{unresolvedChecks.length === 1 ? "" : "s"} need review
+              </summary>
+              <ul className="mt-3 grid gap-2 text-xs text-amber-900 sm:grid-cols-2">
+                {unresolvedChecks.map((check, index) => (
                   <li key={`${check.fileName}-${check.code}-${index}`}>
                     {check.fileName}: {check.label} · {check.status}
                   </li>
                 ))}
               </ul>
-            </div>
+            </details>
           )}
         </article>
       </section>
 
-      <section className="grid gap-4 lg:grid-cols-[1fr_1.3fr_1fr]">
+      <section className="grid gap-4">
         <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="flex items-center gap-2 font-bold text-slate-900">
-            <ShieldAlert className="h-5 w-5 text-amber-600" />
-            Model assessment
-          </h2>
-          {prediction.status === "COMPLETED" ? (
-            <>
-              <p className="mt-3 text-2xl font-extrabold text-slate-900">
-                {prediction.riskLevel || "NOT AVAILABLE"}
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-700">
+              <CircleCheck className="h-5 w-5" />
+            </span>
+            <div>
+              <h2 className="font-bold text-slate-900">Verification summary</h2>
+              <p className="mt-1 text-sm text-slate-500">
+                Document workflow progress at a glance
               </p>
-              <p className="mt-1 text-sm text-slate-600">
-                Model estimate: {prediction.approvalProbability}% approval ·{" "}
-                {prediction.rejectionProbability}% rejection
-              </p>
-              <p className="mt-2 text-xs text-slate-500">
-                {prediction.disclaimer}
-              </p>
-            </>
-          ) : (
-            <p className="mt-3 text-sm text-slate-600">
-              {prediction.message || "No validated model result is available."}
-            </p>
-          )}
-          {canManage && !finalized && prediction.status !== "COMPLETED" && (
-            <button
-              type="button"
-              onClick={runPrediction}
-              disabled={busy}
-              className="mt-4 rounded-lg bg-blue-700 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
-            >
-              {busy ? "Working…" : "Check model availability"}
-            </button>
-          )}
-        </article>
-        <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="font-bold text-slate-900">Verification summary</h2>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <Metric
-              label="Required documents verified"
-              value={`${summary.verificationPercentage ?? 0}%`}
-            />
-            <Metric
-              label="Document readiness"
-              value={`${summary.documentReadiness ?? 0}%`}
-            />
-            <Metric
-              label="Configured points"
-              value={`${summary.earnedPoints ?? 0} / ${summary.maximumPoints ?? 0}`}
-            />
-            <Metric
-              label="OCR page progress"
-              value={`${summary.ocrProgress?.percentage ?? 0}%`}
-            />
-            <Metric
-              label="Missing required documents"
-              value={summary.missingRequiredDocuments?.length ?? 0}
-            />
+            </div>
           </div>
-          <p className="mt-3 text-xs text-slate-500">
-            These are document workflow measures, not visa approval probability.
+          <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            {verificationSummaryMetrics.map((item) => (
+              <div
+                key={item.label}
+                className="rounded-xl border border-slate-100 bg-slate-50/80 p-4"
+              >
+                <p className="text-xs font-medium text-slate-500">{item.label}</p>
+                <p className="mt-2 text-2xl font-bold tracking-tight text-slate-900">
+                  {item.value}
+                </p>
+                {item.detail && (
+                  <p className="mt-1 text-xs text-slate-500">{item.detail}</p>
+                )}
+              </div>
+            ))}
+          </div>
+          <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
+            Workflow indicators only; they do not represent visa approval probability.
           </p>
         </article>
         {readiness && summary.scoringVersion !== "evidence-v3" && (
-          <article className="rounded-2xl border border-indigo-200 bg-white p-5 shadow-sm sm:col-span-2">
+          <article className="rounded-2xl border border-indigo-200 bg-white p-5 shadow-sm">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
-                <p className="text-sm font-semibold text-indigo-700">ពិន្ទុត្រៀមខ្លួន · Readiness Score</p>
-                <p className="mt-1 text-xs text-slate-500">Weighted document and financial evidence assessment</p>
+                <p className="text-sm font-semibold text-indigo-700">Document Requirement Score</p>
+                <p className="mt-1 text-xs text-slate-500">Calculated from the application's saved Requirements Management configuration</p>
               </div>
               <div className="text-right">
                 <p className="text-4xl font-extrabold text-slate-900">{readiness.score}%</p>
-                <p className="text-xs font-semibold text-slate-500">{readiness.riskLevel} RISK</p>
+                <p className="text-xs font-semibold text-slate-500">{readiness.earnedPoints} / {readiness.maximum} points</p>
               </div>
             </div>
             <div className="mt-3 h-3 overflow-hidden rounded-full bg-slate-100">
@@ -949,31 +1066,44 @@ export default function VerificationResultsPage({ profile = {} }) {
             </div>
             {readiness.manualReviewRequired && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-                <strong>Manual review required:</strong> Some passport or bank evidence is incomplete or has low OCR confidence. Do not rely on the automated score until checked.
+                <strong>Manual review required:</strong> One or more documents are processing, incomplete, or awaiting review.
                 {readiness.reviewFlags?.length > 0 && <p className="mt-1">{readiness.reviewFlags.join(" · ")}</p>}
               </div>
             )}
             {readiness.gateApplied && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-                <strong>Gate Rule applied:</strong> Score capped at 40% because a required document is missing or passport validity is under six months.
+                <strong>Required-document gate:</strong> Required items remain incomplete.
                 {readiness.missingRequiredDocuments?.length > 0 && <p className="mt-1">Missing: {readiness.missingRequiredDocuments.join(", ")}</p>}
               </div>
             )}
-            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               {Object.entries(readiness.components || {}).map(([key, item]) => (
-                <div key={key} className="rounded-lg bg-slate-50 p-3">
-                  <p className="text-xs font-medium capitalize text-slate-500">{key.replaceAll("_", " ")}</p>
-                  <p className="mt-1 text-lg font-bold text-slate-900">{item.points ?? 0} / {item.maximum}</p>
-                  {key === "bank_statement" && item.features?.length > 0 && (
+                <div key={key} className="min-h-20 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                  <p className="text-xs font-medium capitalize text-slate-500">
+                    {item.label || key.replaceAll("_", " ")}
+                  </p>
+                  <p className="mt-1 text-lg font-bold text-slate-900">
+                    {item.points == null ? "Not available" : item.points} / {item.maximum}
+                  </p>
+                  {key === "bank_statement" && (
                     <>
-                      <ul className="mt-2 space-y-1 text-xs text-slate-600">
-                        {item.features.map((feature) => <li key={feature.name}>{feature.name.replaceAll("_", " ")}: {feature.points == null ? "Needs evidence" : `${feature.points}/${feature.maximum}`}</li>)}
-                      </ul>
-                      <p className="mt-2 text-xs text-slate-500">OCR confidence: {item.ocrConfidence == null ? "Unavailable" : `${Math.round(item.ocrConfidence * 100)}%`} · Balance reconciliation: {item.balanceReconciliationStatus || "NOT_AVAILABLE"}</p>
+                      <p className="mt-2 text-xs text-slate-500">
+                        OCR confidence: {item.ocrConfidence == null ? "Unavailable" : `${Math.round(item.ocrConfidence * 100)}%`}
+                        {" · "}Balance reconciliation: {item.balanceReconciliationStatus || "NOT_AVAILABLE"}
+                      </p>
                       {Object.keys(item.fieldConfidence || {}).length > 0 && (
-                        <ul className="mt-1 space-y-1 text-xs text-slate-500">
-                          {Object.entries(item.fieldConfidence).map(([field, evidence]) => <li key={field}>{field}: {evidence.confidence == null ? "confidence unavailable" : `${Math.round(evidence.confidence * 100)}%`}</li>)}
-                        </ul>
+                        <details className="mt-2 text-xs text-slate-600">
+                          <summary className="cursor-pointer font-semibold">
+                            OCR field confidence
+                          </summary>
+                          <ul className="mt-2 space-y-1 text-slate-500">
+                            {Object.entries(item.fieldConfidence).map(([field, evidence]) => (
+                              <li key={field}>
+                                {field}: {evidence.confidence == null ? "confidence unavailable" : `${Math.round(evidence.confidence * 100)}%`}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
                       )}
                     </>
                   )}
@@ -991,70 +1121,6 @@ export default function VerificationResultsPage({ profile = {} }) {
             <p className="mt-4 text-xs text-slate-500">{readiness.disclaimer}</p>
           </article>
         )}
-        <article
-          className={`rounded-2xl border p-5 shadow-sm ${finalized ? statusStyle : "border-slate-200 bg-white text-slate-800"}`}
-        >
-          <h2 className="font-bold">Final staff decision</h2>
-          <p className="mt-3 text-xl font-extrabold">
-            {finalized
-              ? report.finalStatus || "RECORDED"
-              : "PENDING STAFF REVIEW"}
-          </p>
-          {finalized ? (
-            <>
-              <p className="mt-1 text-sm">
-                Reviewed by {report.verifiedBy || "—"}
-              </p>
-              {report.administratorComments && (
-                <p className="mt-2 text-sm">{report.administratorComments}</p>
-              )}
-              <p className="mt-2 text-xs">Receipt: {receiptNumber}</p>
-              <button
-                type="button"
-                onClick={downloadReceipt}
-                className="mt-4 inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-800"
-              >
-                <Download className="h-4 w-4" />
-                Download receipt PDF
-              </button>
-            </>
-          ) : (
-            <p className="mt-2 text-sm">
-              Automated checks do not finalize or approve a visa application.
-            </p>
-          )}
-          {needsRefinalization && (
-            <p className="mt-3 text-sm text-amber-900">
-              The evidence or policy changed after the previous receipt. Refresh verification and record a new assessment with a revision reason.
-            </p>
-          )}
-          {results.historicalReceipts?.length > 0 && (
-            <details className="mt-4 text-sm">
-              <summary className="cursor-pointer font-semibold">Previous assessment receipts</summary>
-              <ul className="mt-2 space-y-2">
-                {results.historicalReceipts.map((receipt) => (
-                  <li key={receipt.receiptNumber}>
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="break-words font-medium">{receipt.receiptNumber} · {receipt.finalStatus || "Recorded"}</p>
-                        <p className="mt-1 text-xs text-slate-600">{receipt.reportType || "Historical assessment"} · {receiptTime(receipt.issuedAt)}</p>
-                        <p className="mt-1 text-xs text-slate-600">Historical snapshot only; it does not confirm the current assessment.</p>
-                      </div>
-                      <button type="button" onClick={() => downloadReceiptNumber(receipt.receiptNumber)} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50" aria-label={`Download historical receipt ${receipt.receiptNumber} PDF`}><Download className="h-4 w-4" />Download historical PDF</button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
-          {qrCode && (
-            <img
-              src={qrCode}
-              alt={`QR code for receipt ${receiptNumber}`}
-              className="mt-3 h-20 w-20 rounded bg-white p-1"
-            />
-          )}
-        </article>
       </section>
 
       <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -1064,59 +1130,130 @@ export default function VerificationResultsPage({ profile = {} }) {
         </div>
         {documents.length ? (
           <div className="divide-y divide-slate-100">
-            {documents.map((item) => (
+            {documents.map((item) => {
+              const bankAssessment =
+                bankRequirementScores[item.documentId] ||
+                item.bankStatementAnalysis;
+              const bankAnalysis = item.bankStatementAnalysis || {};
+              const monthlyBalanceChecks =
+                bankAssessment?.monthlyBalanceChecks ||
+                bankAnalysis.monthlyBalanceChecks ||
+                [];
+              const computedBankScore = bankAssessment?.computedBankScore;
+              const confirmedBankScore = bankAssessment?.confirmedBankScore;
+              const bankScorePercentage =
+                computedBankScore?.available &&
+                computedBankScore.points != null &&
+                Number(computedBankScore.maximum) > 0
+                  ? (
+                      (Number(computedBankScore.points) /
+                        Number(computedBankScore.maximum)) *
+                      100
+                    ).toFixed(2)
+                  : null;
+              const requirementContribution =
+                bankAssessment?.requirementContribution;
+              const isBankStatement =
+                Boolean(bankAssessment) ||
+                /bank.*statement|bank_statement/i.test(
+                  `${item.requirementCode || ""} ${item.requirementName || ""}`,
+                );
+              return (
               <details key={item.documentId} className="group p-4">
                 <summary className="flex cursor-pointer flex-wrap items-center justify-between gap-2 text-sm">
-                  <span className="font-semibold text-slate-900">
-                    {item.fileName} · {item.requirementCode}
-                  </span>
-                  <span className="text-xs text-slate-600">
-                    {item.status} · OCR {item.ocrStatus} · {item.pagesProcessed}
-                    /{item.totalPages} pages
-                  </span>
+                  <span className="min-w-0 flex-1 truncate font-semibold text-slate-900">{item.fileName}</span>
+                  <span className="text-xs text-slate-600">{item.status}</span>
+                  {isBankStatement && <span className="rounded-full bg-teal-50 px-2.5 py-1 text-xs font-semibold text-teal-800">
+                    {computedBankScore?.available
+                      ? `Current calculated score: ${Number(computedBankScore.points).toFixed(2)} / ${computedBankScore.maximum}${bankScorePercentage == null ? "" : ` · ${bankScorePercentage}%`}`
+                      : "Score unavailable"}
+                  </span>}
                 </summary>
                 <div className="mt-4 space-y-4">
-                  <p className="text-sm font-semibold text-slate-800">
-                    Status: {String(item.status || "PROCESSING").toUpperCase()}
-                    {" · "}Score:{" "}
-                    {bankRequirementScores[item.documentId]?.score?.available
-                      ? `${bankRequirementScores[item.documentId].score.points} / ${bankRequirementScores[item.documentId].score.maximum} points`
-                      : item.bankStatementAnalysis?.bankStatementScore?.available
-                        ? `${item.bankStatementAnalysis.bankStatementScore.points} / ${item.bankStatementAnalysis.bankStatementScore.maximum} points`
-                        : `${item.awardedPoints ?? 0} / ${item.assignedPoints ?? 0} points`}
-                  </p>
-                  <p className="text-xs text-slate-600">
-                    Document reference: {item.documentReference}
-                    {summary.scoringVersion === "evidence-v3"
-                      ? " · Confirmed points are recorded in the requirement ledger above."
-                      : ` · Points: ${item.awardedPoints}/${item.assignedPoints}`}
-                  </p>
-                  {item.automatedVerification?.crossDocumentChecks?.filter(
+                  {!isBankStatement && <p className="text-sm font-semibold text-slate-800">
+                    Score: {item.awardedPoints ?? "Not available"} / {item.assignedPoints ?? "Not available"}
+                  </p>}
+                  {isBankStatement && (
+                    <details className="rounded-lg border border-slate-200 px-3 py-1 text-xs text-slate-600">
+                      <summary className="cursor-pointer font-semibold">Score and review details</summary>
+                      <div className="grid gap-2 py-2 sm:grid-cols-2">
+                        <p>Document contribution: {requirementContribution?.available && requirementContribution.points != null
+                          ? `${Number(requirementContribution.points).toFixed(2)} / ${requirementContribution.maximum}`
+                          : `Unavailable / ${requirementContribution?.maximum ?? "—"}`}</p>
+                        <p>Confirmed score: {confirmedBankScore?.status === "CONFIRMED"
+                          ? `${confirmedBankScore.points} / ${confirmedBankScore.maximum}`
+                          : "Not yet confirmed"}</p>
+                      </div>
+                    </details>
+                  )}
+                  {isBankStatement && monthlyBalanceChecks.length > 0 && (
+                      <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs">
+                        <p className="font-semibold text-slate-700">Monthly closing balances <span className="font-normal text-slate-500">· supporting evidence</span></p>
+                        <ul className="mt-2 grid gap-2 text-slate-600 sm:grid-cols-3">
+                          {monthlyBalanceChecks.map((month) => {
+                            const formatUsd = (value) => {
+                              const amount = Number(value);
+                              return value == null || !Number.isFinite(amount)
+                                ? "Unavailable"
+                                : `USD ${amount.toLocaleString("en-US", {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })}`;
+                            };
+                            const belowMinimum =
+                              month.minimumBalanceStatus === "BELOW_MINIMUM";
+                            return (
+                              <li key={month.month} className={`rounded-md p-2 ${belowMinimum ? "border border-red-200 bg-red-50" : "bg-slate-50"}`}>
+                                <strong className="text-slate-800">{month.month}</strong>
+                                {" · "}
+                                {belowMinimum ? (
+                                  <span className="font-semibold text-red-700">Below minimum · manual review</span>
+                                ) : month.closingBalance == null ? (
+                                  "Balance unavailable"
+                                ) : (
+                                  `${String(month.currency || "USD").toUpperCase()} ${Number(month.closingBalance).toLocaleString(
+                                    "en-US",
+                                    { minimumFractionDigits: 2, maximumFractionDigits: 2 },
+                                  )}`
+                                )}
+                                {belowMinimum && (
+                                  <span className="mt-1 block font-medium text-red-700">
+                                    Closing balance: {formatUsd(month.closingBalance)} · Minimum: {formatUsd(month.minimumRequired)} · Shortfall: {formatUsd(month.shortfall)}
+                                  </span>
+                                )}
+                                {month.sourcePage
+                                  ? <span className="mt-1 block text-slate-500">Page {month.sourcePage}{month.sourceTransaction ? ` · row ${month.sourceTransaction}` : ""}</span>
+                                  : ""}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </div>
+                    )}
+                  <details className="text-xs text-slate-600">
+                    <summary className="cursor-pointer font-semibold">Document and OCR details</summary>
+                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                      <p>Reference: {item.documentReference || "Unavailable"}</p>
+                      <p>OCR: {item.ocrStatus || "Unavailable"} · {item.pagesProcessed}/{item.totalPages} pages</p>
+                      <p>OCR confidence: {item.ocrConfidence == null ? "Unavailable" : `${Math.round(Number(item.ocrConfidence) * 100)}%`}</p>
+                      <p>Missing fields: {(item.missingFields || []).length ? item.missingFields.join(", ") : "None"}</p>
+                      {summary.scoringVersion !== "evidence-v3" && <p>Points: {item.awardedPoints}/{item.assignedPoints}</p>}
+                    </div>
+                  </details>
+                  {item.automatedVerification?.crossDocumentChecks?.some(
                     (check) => check.status !== "PASSED",
-                  ).map((check) => (
-                    <p
-                      key={check.code}
-                      className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900"
-                    >
-                      {check.label}: {check.reason}
-                    </p>
-                  ))}
-                  <div className="grid gap-2 rounded-lg border border-blue-100 bg-blue-50/60 p-3 text-xs sm:grid-cols-3">
-                    <div>
-                      <p className="font-semibold text-slate-700">OCR status</p>
-                      <p className="mt-1 text-slate-600">{item.ocrStatus || "NOT_AVAILABLE"}</p>
-                    </div>
-                    <div>
-                      <p className="font-semibold text-slate-700">OCR confidence</p>
-                      <p className="mt-1 text-slate-600">
-                        {item.ocrConfidence == null ? "Unavailable" : `${Math.round(Number(item.ocrConfidence) * 100)}%`}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="font-semibold text-slate-700">Missing fields</p>
-                      <p className="mt-1 text-slate-600">{(item.missingFields || []).length ? item.missingFields.join(", ") : "None"}</p>
-                    </div>
-                  </div>
+                  ) && (
+                    <details className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                      <summary className="cursor-pointer font-semibold">
+                        Other review notes ({item.automatedVerification.crossDocumentChecks.filter((check) => check.status !== "PASSED").length})
+                      </summary>
+                      <ul className="mt-2 list-disc space-y-1 pl-5">
+                        {item.automatedVerification.crossDocumentChecks
+                          .filter((check) => check.status !== "PASSED")
+                          .map((check) => <li key={check.code}>{check.label}: {check.reason}</li>)}
+                      </ul>
+                    </details>
+                  )}
                   {item.automatedVerification && !item.abaStatementAnalysis && (
                     <AutomatedVerificationReport
                       verification={item.automatedVerification}
@@ -1124,11 +1261,14 @@ export default function VerificationResultsPage({ profile = {} }) {
                     />
                   )}
                   {item.abaStatementAnalysis && canManage && (
-                    <AbaBankPanel documentId={item.documentId} applicationId={applicationId} canManage={canManage} onChange={loadResults} requirementScore={(summary.requirementScores || []).find(r => r.documentIds?.includes(item.documentId))} />
+                    <AbaBankPanel documentId={item.documentId} applicationId={applicationId} canManage={canManage} onChange={loadResults} />
                   )}
                   {item.bankStatementAnalysis && !item.abaStatementAnalysis && (
                       <BankStatementAnalysis
                         analysis={item.bankStatementAnalysis}
+                        documentId={item.documentId}
+                        canManage={canManage}
+                        onChange={loadResults}
                         requirementScore={{
                           ...(bankRequirementScores[item.documentId] || {}),
                           maximumConfiguredPoints:
@@ -1255,90 +1395,106 @@ export default function VerificationResultsPage({ profile = {} }) {
                       </dl>
                     </details>
                   )}
-                  {Object.keys(item.fieldEvidence || {}).length > 0 && (
-                    <details className="rounded-lg border border-blue-100 bg-blue-50/50 p-3">
-                      <summary className="cursor-pointer text-sm font-semibold text-slate-800">
-                        Document extraction evidence
-                      </summary>
-                      <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-                        {Object.entries(item.fieldEvidence).map(([key, evidence]) => (
-                          <div key={key} className="min-w-0">
-                            <dt className="font-medium text-slate-500">{key}</dt>
-                            <dd className="break-words text-slate-800">
-                              {String(evidence?.value ?? "—")} · {evidence?.source || "OCR"} ·{" "}
-                              {evidence?.page == null ? "page unavailable" : `page ${evidence.page}`} ·{" "}
-                              {evidence?.confidence == null ? "confidence unavailable" : `${Math.round(Number(evidence.confidence) * 100)}%`}
-                              {evidence?.evidenceText && (
-                                <span className="mt-1 block text-slate-500">
-                                  Source: {evidence.evidenceText}
-                                </span>
-                              )}
-                            </dd>
-                          </div>
-                        ))}
-                      </dl>
-                    </details>
-                  )}
                 </div>
               </details>
-            ))}
+              );
+            })}
           </div>
         ) : (
           <p className="p-5 text-sm text-slate-500">No documents uploaded.</p>
         )}
       </section>
 
-      {canManage && !finalized && (
-        <form
-          onSubmit={finalize}
-          className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
-        >
-          <h2 className="text-xl font-bold text-slate-900">
-            Complete staff verification
-          </h2>
-          <p className="text-sm text-slate-600">
-            Evidence-only reports require current document and staff verification. Prediction reports additionally require a current validated model estimate.
-          </p>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="text-sm font-medium text-slate-700">
-              Report type
-              <select value={reportType} onChange={e => setReportType(e.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2">
-                <option value="EVIDENCE_ASSESSMENT">Evidence assessment only</option>
-                <option value="PREDICTION">Evidence and approval prediction</option>
-              </select>
-            </label>
-            <label className="text-sm font-medium text-slate-700">
-              Final verification status
-              <select
-                value={finalStatus}
-                onChange={(event) => setFinalStatus(event.target.value)}
-                className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2"
-              >
-                <option value="VERIFIED">Verified</option>
-                <option value="REJECTED">Rejected</option>
-              </select>
-            </label>
-            <label className="text-sm font-medium text-slate-700">
-              {needsRefinalization ? "Revision reason (at least 8 characters)" : "Administrator comments"}
-              <input
-                required={needsRefinalization || finalStatus === "REJECTED"}
-                minLength={needsRefinalization ? 8 : undefined}
-                maxLength={2000}
-                value={comments}
-                onChange={(event) => setComments(event.target.value)}
-                className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2"
-              />
-            </label>
+      <section className="verification-invoice" aria-label="Visa service invoice">
+        <header className="verification-invoice-header">
+          <div className="verification-invoice-brand">
+            <span>V</span>
+            <div>
+              <strong>VISA DOC AI</strong>
+              <small>Visa Application &amp; Document Processing Services</small>
+              <small>Phnom Penh, Cambodia</small>
+            </div>
           </div>
-          <button
-            type="submit"
-            disabled={busy}
-            className="rounded-xl bg-blue-700 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
-          >
-            {busy ? "Working…" : needsRefinalization ? "Finalize revised assessment" : "Finalize and generate receipt"}
-          </button>
-        </form>
-      )}
+          <div className="verification-invoice-number">
+            <span>Invoice</span>
+            <strong>{receiptNumber || application.applicationNumber || `INV-${applicationId.slice(-8).toUpperCase()}`}</strong>
+          </div>
+        </header>
+
+        <div className="verification-invoice-meta">
+          <div>
+            <span>Issue date</span>
+            <strong>{reportDate ? new Date(reportDate).toLocaleDateString("en-US") : "—"}</strong>
+          </div>
+          <div>
+            <span>Payment status</span>
+            <strong>{finalized ? "Paid / recorded" : "Unpaid"}</strong>
+          </div>
+        </div>
+
+        <div className="verification-invoice-section">
+          <h2>Applicant information</h2>
+          <div className="verification-invoice-grid">
+            <div><span>Applicant name</span><strong>{applicant.fullName || "—"}</strong></div>
+            <div><span>Passport number</span><strong>{applicant.passportNumber || "—"}</strong></div>
+            <div><span>Nationality</span><strong>{applicant.nationality || "—"}</strong></div>
+            <div><span>Destination country</span><strong>{application.destination || "—"}</strong></div>
+            <div><span>Visa type</span><strong>{application.visaTypeName || "—"}</strong></div>
+            <div><span>Application reference</span><strong>{application.applicationNumber || application.id || "—"}</strong></div>
+          </div>
+        </div>
+
+        <div className="verification-invoice-section">
+          <h2>Invoice details</h2>
+          <table>
+            <thead>
+              <tr><th>Description</th><th>Amount (USD)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Visa Application Service Fee</td><td>Not recorded</td></tr>
+              <tr><td>Document Preparation &amp; Review</td><td>Not recorded</td></tr>
+              <tr><td>Visa Application Government Fee</td><td>Not recorded</td></tr>
+              <tr><td>Additional Service Fee</td><td>Not recorded</td></tr>
+              <tr><td>Discount</td><td>Not recorded</td></tr>
+              <tr className="verification-invoice-total"><td>Total amount due</td><td>Not recorded</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div className="verification-invoice-section verification-invoice-payment">
+          <h2>Payment information</h2>
+          <div>
+            <span>Payment method</span>
+            <strong>Not recorded</strong>
+          </div>
+          <div>
+            <span>Amount paid</span>
+            <strong>Not recorded</strong>
+          </div>
+          <div>
+            <span>Outstanding balance</span>
+            <strong>Not recorded</strong>
+          </div>
+        </div>
+
+        <footer className="verification-invoice-footer">
+          <div>
+            <h2>Terms &amp; conditions</h2>
+            <ol>
+              <li>Payment must be made by the due date stated above.</li>
+              <li>Government visa fees are subject to the applicable authority.</li>
+              <li>Service fees are separate from government visa fees.</li>
+              <li>Visa approval is determined solely by the relevant immigration authority.</li>
+            </ol>
+          </div>
+          <div className="verification-invoice-signature">
+            <span>Authorized by</span>
+            <strong>________________________</strong>
+            <small>Signature</small>
+          </div>
+        </footer>
+      </section>
+
     </main>
   );
 }

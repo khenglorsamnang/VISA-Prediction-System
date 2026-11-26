@@ -109,5 +109,9 @@ async def application_profile_fields(database: Any, visa_type_id: Any, *, as_of:
 
 
 def requirement_snapshot(item: dict[str, Any]) -> dict[str, Any]:
-    fields = ("name","code","description","required","conditional","weight","displayOrder","acceptedFormats","maxFileSize","allowMultiple","source","sourceStatus","effectiveFrom",*SCORING_FIELDS)
-    return {"requirementId":requirement_id(item),**{key:deepcopy(item[key]) for key in fields if key in item}}
+    fields = ("name","code","description","required","conditional","weight","maximumEarnedPoints","displayOrder","acceptedFormats","maxFileSize","allowMultiple","source","sourceStatus","effectiveFrom","status","configurationVersion",*SCORING_FIELDS)
+    snapshot = {"requirementId":requirement_id(item),**{key:deepcopy(item[key]) for key in fields if key in item}}
+    maximum = item.get("maximumEarnedPoints", item.get("weight", item.get("points", 0)))
+    snapshot["weight"] = deepcopy(maximum)
+    snapshot["maximumEarnedPoints"] = deepcopy(maximum)
+    return snapshot

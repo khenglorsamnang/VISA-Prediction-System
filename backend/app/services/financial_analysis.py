@@ -164,6 +164,7 @@ def calculate_financial_analysis(
         balance = _number(item.get("running_balance"))
         normalized_transactions.append(
             {
+                "transactionIndex": item.get("transactionIndex"),
                 "date": transaction_date,
                 "amount": abs(amount) if amount is not None else None,
                 "direction": direction,
@@ -178,6 +179,9 @@ def calculate_financial_analysis(
                 "runningBalance": _round(balance),
                 "sourceText": item.get("sourceText") or item.get("evidence") or "",
                 "referenceNumber": item.get("referenceNumber"),
+                "sender": item.get("sender"),
+                "receiver": item.get("receiver"),
+                "counterparty": item.get("counterparty"),
             }
         )
 
@@ -581,6 +585,7 @@ def calculate_financial_analysis(
         },
         "normalized_transactions": [
             {
+                "transactionIndex": item["transactionIndex"],
                 "date": item["date"].isoformat() if item["date"] else None,
                 "description": item["description"],
                 "amount": _round(item["amount"]),
@@ -595,6 +600,9 @@ def calculate_financial_analysis(
                 "runningBalance": item["runningBalance"],
                 "sourceText": item["sourceText"],
                 "referenceNumber": item["referenceNumber"],
+                "sender": item["sender"],
+                "receiver": item["receiver"],
+                "counterparty": item["counterparty"],
             }
             for item in normalized_transactions
         ],

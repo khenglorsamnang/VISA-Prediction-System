@@ -52,7 +52,10 @@ class _Database:
         return self.collections[name]
 
 
-def _case(passport_name: str = "Sample Applicant") -> tuple[_Database, dict[str, Any]]:
+def _case(
+    passport_name: str = "Sample Applicant",
+    bank_holder_name: str = "Sample Applicant",
+) -> tuple[_Database, dict[str, Any]]:
     bank_score = {
         "available": True,
         "points": 21.99,
@@ -89,7 +92,7 @@ def _case(passport_name: str = "Sample Applicant") -> tuple[_Database, dict[str,
         "awardedPoints": 0,
         "bankStatementAnalysis": {"bankStatementScore": bank_score, "historicalScore": 21.99},
         "extractedFields": {
-            "accountHolderName": "Sample Applicant",
+            "accountHolderName": bank_holder_name,
             "statementStartDate": "2026-01-01",
             "statementEndDate": "2026-03-31",
         },
@@ -157,7 +160,9 @@ def _case(passport_name: str = "Sample Applicant") -> tuple[_Database, dict[str,
         _Database(
             {
                 "visaapplications": _Collection([application]),
-                "customers": _Collection([{"_id": "applicant"}]),
+                "customers": _Collection(
+                    [{"_id": "applicant", "fullName": "Sample Applicant"}]
+                ),
                 "visarequirements": _Collection([]),
                 "documents": _Collection(documents),
             }
@@ -192,10 +197,10 @@ async def test_bank_statement_verifies_with_cross_document_checks_without_changi
 
 
 @pytest.mark.asyncio
-async def test_cross_document_conflict_blocks_bank_verification_with_exact_reason(
+async def test_different_account_holder_name_does_not_block_bank_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database, bank_score = _case(passport_name="Different Person")
+    database, bank_score = _case(bank_holder_name="SIM KEE SIANG")
 
     async def skip_application_score_refresh(_database: Any, _application: Any) -> None:
         return None
@@ -206,13 +211,12 @@ async def test_cross_document_conflict_blocks_bank_verification_with_exact_reaso
     await documents_api._refresh_cross_document_consistency(database, "application")
 
     bank = database["documents"].rows[0]
-    assert bank["status"] == "NEEDS_REVIEW"
-    assert any(
+    assert bank["status"] == "VERIFIED"
+    assert not any(
         check["code"] == "CROSS_FULLNAME"
-        and check["reason"]
-        == "The full name conflicts with the applicant information or another submitted document."
         for check in bank["automatedVerification"]["crossDocumentChecks"]
     )
+    assert bank["extractedFields"]["accountHolderName"] == "SIM KEE SIANG"
     assert bank["bankStatementAnalysis"]["bankStatementScore"] == bank_score
 
 
@@ -247,8 +251,9 @@ async def test_verified_aba_requires_review_and_reconciliation_gate(
     bank["automatedVerification"]["baseStatus"] = "NEEDS_REVIEW"
     bank["abaStatementAnalysis"] = {
         "reviewStatus": "VERIFIED",
-        "ownerRelationshipConfirmed": True,
         "reconciliationStatus": "RECONCILED",
+        "statementStrengthScore": 5.5,
+        "score": {"provisional": False},
     }
 
     async def skip_application_score_refresh(_database: Any, _application: Any) -> None:
@@ -260,7 +265,37 @@ async def test_verified_aba_requires_review_and_reconciliation_gate(
     await documents_api._refresh_cross_document_consistency(database, "application")
 
     assert bank["status"] == "VERIFIED"
-    assert any(
-        check["code"] == "CROSS_ABA_REVIEW" and check["status"] == "PASSED"
-        for check in bank["automatedVerification"]["crossDocumentChecks"]
+    aba_check=next(check for check in bank["automatedVerification"]["crossDocumentChecks"] if check["code"]=="CROSS_ABA_REVIEW")
+    assert aba_check["status"]=="PASSED"
+    assert "account relationship" not in aba_check["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_aba_cross_check_explains_actual_unresolved_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, _ = _case()
+    bank = database["documents"].rows[0]
+    bank["abaStatementAnalysis"] = {
+        "reviewStatus": "PENDING_REVIEW",
+        "reconciliationStatus": "NEEDS_REVIEW",
+        "reviewBlockers": [{
+            "code": "summary_field_conflict",
+            "field": "ending",
+            "pages": [1, 2],
+            "message": "Conflicting ending balance values were extracted from multiple pages.",
+        }],
+    }
+
+    async def skip_application_score_refresh(_database: Any, _application: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        documents_api, "_refresh_application_score", skip_application_score_refresh
     )
+    await documents_api._refresh_cross_document_consistency(database, "application")
+
+    aba_check=next(check for check in bank["automatedVerification"]["crossDocumentChecks"] if check["code"]=="CROSS_ABA_REVIEW")
+    assert aba_check["status"]=="NEEDS_REVIEW"
+    assert "Conflicting ending balance values" in aba_check["reason"]
+    assert "account relationship" not in aba_check["reason"].lower()

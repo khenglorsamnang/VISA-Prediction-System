@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import PyMongoError
 
-from ..core.config import PROJECT_ROOT, settings
+from ..core.config import BANK_STATEMENT_MAX_FILE_SIZE, PROJECT_ROOT, settings
 from ..core.errors import APIError
 from ..services.bank_statement_scoring import calculate_document_verification_score
 from ..services.aba_integration import analyze_aba_pdf, aba_to_legacy_ocr, decrypted_render_bytes, reviewed_analysis
@@ -27,10 +27,17 @@ from ..services.automated_document_verification import (
     evaluate_automated_document_verification,
 )
 from ..services.bank_statement_scoring import analyze_bank_statement
-from ..services.business_rules import DEFAULT_RULE_POLICY, validate_rule_policy
-from ..services.document_metrics import bank_requirement_points, summarize_documents
+from ..services.business_rules import (
+    DEFAULT_RULE_POLICY,
+    validate_rule_policy,
+)
+from ..services.document_metrics import (
+    bank_requirement_points,
+    summarize_documents,
+)
 from ..services.photo_validation import validate_applicant_photo
 from ..services.assessment_context import application_requirements, canonical_summary, policy_snapshot
+from ..services.readiness_scoring import calculate_bank_score_assessment
 from ..services.cross_document_consistency import (
     document_consistency_checks,
     document_kind,
@@ -69,6 +76,16 @@ def _is_bank_requirement(requirement: dict[str, Any], document: dict[str, Any] |
         )
     ).casefold()
     return "bank" in value and ("statement" in value or "3 month" in value or "3_month" in value)
+
+
+def _aba_review_messages(analysis: dict[str, Any]) -> list[str]:
+    blockers = analysis.get("reviewBlockers") or []
+    messages = [
+        str(item.get("message"))
+        for item in blockers
+        if isinstance(item, dict) and item.get("message")
+    ]
+    return messages
 
 
 async def _refresh_application_score(database: AsyncDatabase, application: dict[str, Any] | None) -> None:
@@ -187,18 +204,24 @@ async def _refresh_cross_document_consistency(
             aba = document["abaStatementAnalysis"]
             aba_verified = (
                 aba.get("reviewStatus") == "VERIFIED"
-                and aba.get("ownerRelationshipConfirmed") is True
                 and aba.get("reconciliationStatus") == "RECONCILED"
+                and aba.get("statementStrengthScore") is not None
+                and not (aba.get("score") or {}).get("provisional")
             )
+            blockers = _aba_review_messages(aba)
             cross_checks.append(
                 {
                     "code": "CROSS_ABA_REVIEW",
                     "label": "Exact bank evidence review",
                     "status": "PASSED" if aba_verified else "NEEDS_REVIEW",
                     "reason": (
-                        "The exact bank evidence, reconciliation, and account relationship have been reviewed."
+                        "Financial evidence and reconciliation passed staff review; authenticity remains unverified and is tracked separately."
                         if aba_verified
-                        else "The current ABA extraction and account relationship still require review."
+                        else "; ".join(blockers)
+                        or (
+                            "Financial evidence is reconciled with no extraction blockers; staff bank-evidence review is pending. "
+                            "Authenticity remains unverified and is tracked separately."
+                        )
                     ),
                     "fields": ["abaStatementAnalysis"],
                 }
@@ -339,6 +362,16 @@ async def _persist_initial_bank_statement_analysis(
         financial_config=policy["financial_scoring"],
         ocr_complete=str(fresh_document.get("ocrStatus") or "").upper()
         == "OCR_COMPLETED",
+        transaction_source_reviews=fresh_document.get("transactionSourceReviews") or {},
+        document_id=str(fresh_document.get("_id") or ""),
+    )
+    analysis.update(
+        calculate_bank_score_assessment(
+            fresh_document,
+            analysis,
+            applicant,
+            requirement_maximum=fresh_document.get("requirementMaximumPoints"),
+        )
     )
     await database["documents"].update_one(
         {"_id": fresh_document["_id"]},
@@ -938,12 +971,32 @@ async def _run_automated_document_verification(
     fresh_document = await database["documents"].find_one(id_query(str(document["_id"])))
     if fresh_document and fresh_document.get("abaStatementAnalysis"):
         result["status"] = "NEEDS_REVIEW"
-        result["reasons"] = [*(result.get("reasons") or []), "Review the current ABA analysis and account-holder relationship using the bank evidence review."]
+        aba_review = fresh_document["abaStatementAnalysis"]
+        blockers = [
+            str(item.get("message"))
+            for item in aba_review.get("reviewBlockers") or []
+            if isinstance(item, dict) and item.get("message")
+        ]
+        result["reasons"] = [
+            *(result.get("reasons") or []),
+            *blockers,
+            *(
+                ["Staff financial-evidence review remains pending; authenticity is not verified."]
+                if not blockers
+                else []
+            ),
+        ]
     assigned_points = 0.0
     try:
         assigned_points = max(
             0.0,
-            float(requirement.get("weight", requirement.get("points", 0)) or 0),
+            float(
+                requirement.get(
+                    "maximumEarnedPoints",
+                    requirement.get("weight", requirement.get("points", 0)),
+                )
+                or 0
+            ),
         )
     except (TypeError, ValueError):
         logger.warning(
@@ -952,6 +1005,21 @@ async def _run_automated_document_verification(
         )
     now = datetime.now(timezone.utc)
     result["verificationTimestamp"] = now.isoformat()
+    if isinstance(bank_statement_analysis, dict):
+        score_document = {
+            **verification_document,
+            "status": result.get("status"),
+            "reviewedBy": document.get("reviewedBy"),
+            "manualReviewHistory": document.get("manualReviewHistory"),
+        }
+        bank_statement_analysis.update(
+            calculate_bank_score_assessment(
+                score_document,
+                bank_statement_analysis,
+                applicant,
+                requirement_maximum=assigned_points,
+            )
+        )
     history = list(document.get("automatedVerificationHistory") or [])
     history.append(result)
     update = {
@@ -970,6 +1038,8 @@ async def _run_automated_document_verification(
         ),
         "updatedAt": now,
     }
+    if isinstance(bank_statement_analysis, dict):
+        update["bankStatementAnalysis"] = bank_statement_analysis
     if is_photo:
         update.update(
             {
@@ -1022,13 +1092,48 @@ async def _complete_local_aba(document: dict[str, Any], database: AsyncDatabase,
     fields = legacy["fields"]
     count = int((analysis.get("statement") or {}).get("pages") or 0)
     complete = bool(analysis.get("statement"))
+    review_messages = _aba_review_messages(analysis)
     check = calculate_document_verification_score(fields) if complete else None
     compatibility_analysis = None
     if complete:
         policy_record = await database["business_rules"].find_one({"_id":"visa_financial_rules"})
         policy = validate_rule_policy(policy_record.get("policy") if policy_record else DEFAULT_RULE_POLICY)
-        compatibility_analysis = analyze_bank_statement(fields, raw_text="", config=policy["bank_statement_scoring"], financial_config=policy["financial_scoring"], ocr_complete=True)
+        application = await database["visaapplications"].find_one(
+            id_query(str(fresh.get("applicationId") or ""))
+        )
+        applicant_id = str(
+            (application or {}).get("customer")
+            or (application or {}).get("customerId")
+            or fresh.get("customerId")
+            or ""
+        )
+        applicant = (
+            await database["customers"].find_one(id_query(applicant_id))
+            if applicant_id
+            else None
+        ) or {}
+        compatibility_analysis = analyze_bank_statement(
+            fields,
+            raw_text="",
+            config=policy["bank_statement_scoring"],
+            financial_config=policy["financial_scoring"],
+            applicant_name=str(applicant.get("fullName") or ""),
+            ocr_complete=True,
+            transaction_source_reviews=fresh.get("transactionSourceReviews") or {},
+            document_id=str(fresh.get("_id") or ""),
+        )
         compatibility_analysis["evidenceConvention"] = "Legacy major-unit diagnostic only; authoritative ABA values are in abaStatementAnalysis."
+        compatibility_analysis.update(
+            calculate_bank_score_assessment(
+                {
+                    **fresh,
+                    "extractedFields": fields,
+                    "abaStatementAnalysis": analysis,
+                },
+                compatibility_analysis,
+                requirement_maximum=fresh.get("requirementMaximumPoints"),
+            )
+        )
     now = datetime.now(timezone.utc)
     await collection.update_one(
         {"_id": document["_id"], "ocrLeaseOwner": lease_id, "status": {"$nin": ["DELETED", "REPLACED"]}},
@@ -1037,9 +1142,17 @@ async def _complete_local_aba(document: dict[str, Any], database: AsyncDatabase,
             "bankStatementAnalysis": compatibility_analysis,
             "ocrStatus": "OCR_COMPLETED" if complete else "OCR_FAILED", "ocrPagesProcessed": count,
             "ocrTotalPages": count, "ocrPageNumbers": list(range(1,count+1)), "ocrProgressPercent": 100 if complete else 0,
-            "ocrMessage": "ABA statement extracted locally. Review exact checks and account-holder relationship.",
+            "ocrMessage": (
+                "ABA statement extracted locally. Review the listed unresolved financial or extraction evidence; authenticity remains unverified."
+                if review_messages
+                else "ABA statement extracted locally with no listed extraction or financial blockers. Staff review and authenticity verification remain separate."
+            ),
             "ocrError": "" if complete else "; ".join(i["message"] for i in analysis.get("issues", [])),
-            "ocrFieldEvidence": {"method": "ABA_NATIVE_LOCAL", "numericConfidenceAvailable": False},
+            "ocrFieldEvidence": {
+                "method": "ABA_NATIVE_LOCAL",
+                "numericConfidenceAvailable": False,
+                "sourcePages": analysis.get("fieldEvidence") or {},
+            },
             "ocrConfidence": None,
             "extractedFields": fields, "contentHash": content_hash,
             "ocrWarnings": legacy["warnings"], "detectedDocumentType": "bank_statement",
@@ -1049,7 +1162,8 @@ async def _complete_local_aba(document: dict[str, Any], database: AsyncDatabase,
             "automatedVerification": {
                 "status": "NEEDS_REVIEW" if complete else "FAILED",
                 "reasons": (
-                    ["Exact ABA analysis and account ownership require staff review."]
+                    review_messages
+                    or ["No extraction or reconciliation blockers were detected; staff bank-evidence review remains pending and authenticity is not verified."]
                     if complete
                     else ["Bank statement extraction failed."]
                 ),
@@ -1481,15 +1595,6 @@ async def upload_document(
     if not signatures:
         return JSONResponse(status_code=400, content={"message": "Only PDF, JPG, JPEG, and PNG files are supported"})
 
-    content = await file.read(settings.max_file_size + 1)
-    await file.close()
-    if not content:
-        return JSONResponse(status_code=400, content={"message": "The uploaded file is empty"})
-    if len(content) > settings.max_file_size:
-        return JSONResponse(status_code=413, content={"message": "Uploaded file exceeds the configured maximum size"})
-    if not any(content.startswith(signature) for signature in signatures):
-        return JSONResponse(status_code=400, content={"message": "File content does not match its extension"})
-
     try:
         application = await database["visaapplications"].find_one(id_query(application_id))
         if not application:
@@ -1497,8 +1602,22 @@ async def upload_document(
         owner_id = str(application.get("customer") or application.get("customerId") or "")
         if principal["role"] == "CUSTOMER" and owner_id != principal["id"]:
             return JSONResponse(status_code=404, content={"message": "Application not found"})
-        snapshot = policy_snapshot(application)
-        requirement = next((r for r in snapshot["requirements"] if str(r.get("requirementId") or r.get("_id") or "") == requirement_id), None) if snapshot else await database["visarequirements"].find_one(id_query(requirement_id))
+        current_requirements = await database["visarequirements"].find(
+            {"visaTypeId": application.get("visaTypeId"), "status": "ACTIVE"}
+        ).to_list(length=None)
+        application_snapshot = application_requirements(
+            application,
+            current_requirements or application.get("requirementSnapshot") or [],
+        )
+        requirement = next(
+            (
+                item
+                for item in application_snapshot
+                if str(item.get("requirementId") or item.get("_id") or "")
+                == requirement_id
+            ),
+            None,
+        )
         if not requirement:
             return JSONResponse(status_code=404, content={"message": "Requirement not found"})
         if str(requirement.get("visaTypeId")) != str(application.get("visaTypeId")):
@@ -1508,12 +1627,32 @@ async def upload_document(
             }
             if requirement_id not in snapshot_ids:
                 return JSONResponse(status_code=400, content={"message": "Requirement does not belong to this application"})
-        max_size = min(int(requirement.get("maxFileSize") or settings.max_file_size), settings.max_file_size)
-        if len(content) > max_size:
-            return JSONResponse(status_code=413, content={"message": "File exceeds the requirement size limit"})
-        accepted = [str(item).lower().lstrip(".") for item in requirement.get("acceptedFormats", [])]
-        if accepted and extension.lstrip(".") not in accepted:
-            return JSONResponse(status_code=400, content={"message": "File format is not accepted for this requirement"})
+    except PyMongoError as error:
+        logger.exception("Could not verify document upload: %s", error.__class__.__name__)
+        raise APIError(503, "Document upload could not be verified") from error
+
+    detected_type = _document_type(requirement)
+    max_size = (
+        BANK_STATEMENT_MAX_FILE_SIZE
+        if detected_type == "bank_statement"
+        else min(
+            int(requirement.get("maxFileSize") or settings.max_file_size),
+            settings.max_file_size,
+        )
+    )
+    accepted = [str(item).lower().lstrip(".") for item in requirement.get("acceptedFormats", [])]
+    if accepted and extension.lstrip(".") not in accepted:
+        return JSONResponse(status_code=400, content={"message": "File format is not accepted for this requirement"})
+    content = await file.read(max_size + 1)
+    await file.close()
+    if not content:
+        return JSONResponse(status_code=400, content={"message": "The uploaded file is empty"})
+    if len(content) > max_size:
+        return JSONResponse(status_code=413, content={"message": "File exceeds the requirement size limit"})
+    if not any(content.startswith(signature) for signature in signatures):
+        return JSONResponse(status_code=400, content={"message": "File content does not match its extension"})
+
+    try:
         duplicate = await database["documents"].find_one(
             {
                 "applicationId": application_id,
@@ -1539,7 +1678,6 @@ async def upload_document(
         storage_path = _PRIVATE_DIR / f"{document_id}{extension}"
         _PRIVATE_DIR.mkdir(parents=True, exist_ok=True)
         storage_path.write_bytes(content)
-        detected_type = _document_type(requirement)
         now = datetime.now(timezone.utc)
         document = {
             "_id": document_id,
@@ -1548,6 +1686,10 @@ async def upload_document(
             "customerId": str(application.get("customer") or application.get("customerId") or ""),
             "visaTypeId": str(application.get("visaTypeId") or ""),
             "requirementId": requirement_id,
+            "requirementMaximumPoints": requirement.get(
+                "maximumEarnedPoints",
+                requirement.get("weight", requirement.get("points", 0)),
+            ),
             "requirementCode": detected_type,
             "fileName": safe_filename,
             "mimeType": {
@@ -1936,18 +2078,24 @@ async def ocr_document(
             status_code=400,
             content={"message": "Only PDF, JPG, JPEG, and PNG files are supported"},
         )
-    content = await file.read(settings.max_file_size + 1)
+    normalized_requirement_code = requirement_code.strip().lower() or "unknown"
+    max_file_size = (
+        BANK_STATEMENT_MAX_FILE_SIZE
+        if normalized_requirement_code == "bank_statement"
+        else settings.max_file_size
+    )
+    content = await file.read(max_file_size + 1)
     await file.close()
     if not content:
         return JSONResponse(status_code=400, content={"message": "The uploaded file is empty"})
-    if len(content) > settings.max_file_size:
+    if len(content) > max_file_size:
         return JSONResponse(status_code=413, content={"message": "Uploaded file exceeds the configured maximum size"})
     if not any(content.startswith(signature) for signature in signatures):
         return JSONResponse(status_code=400, content={"message": "File content does not match its extension"})
     result = await _run_ocr(
         content,
         filename,
-        requirement_code.strip().lower() or "unknown",
+        normalized_requirement_code,
     )
     if result is None:
         return JSONResponse(status_code=503, content={"message": "OCR service is unavailable"})
@@ -2118,7 +2266,11 @@ async def review_document(
             awarded_points = max(
                 0.0,
                 float(
-                    requirement.get("weight", requirement.get("points", 0)) or 0
+                    requirement.get(
+                        "maximumEarnedPoints",
+                        requirement.get("weight", requirement.get("points", 0)),
+                    )
+                    or 0
                 ),
             )
         except (TypeError, ValueError):
@@ -2138,8 +2290,28 @@ async def review_document(
             "reviewedAt": now.isoformat(),
             "previousStatus": str(document.get("status") or "PROCESSING").upper(),
         }
+        bank_statement_analysis = document.get("bankStatementAnalysis")
+        if isinstance(bank_statement_analysis, dict):
+            reviewed_document = {
+                **document,
+                "status": status,
+                "reviewedBy": principal["id"],
+                "manualReviewHistory": [
+                    *(document.get("manualReviewHistory") or []),
+                    review_event,
+                ],
+                **({"abaStatementAnalysis": aba_review} if aba_review is not None else {}),
+            }
+            bank_statement_analysis = {
+                **bank_statement_analysis,
+                **calculate_bank_score_assessment(
+                    reviewed_document,
+                    bank_statement_analysis,
+                    requirement_maximum=awarded_points,
+                ),
+            }
         awarded_points = (
-            bank_requirement_points(document.get("bankStatementAnalysis"), awarded_points)
+            bank_requirement_points(bank_statement_analysis, awarded_points)
             if _is_bank_requirement(requirement, document) and status == "VERIFIED"
             else awarded_points if status == "VERIFIED" else 0
         )
@@ -2156,6 +2328,11 @@ async def review_document(
                     "reviewedAt": now,
                     "reviewReason": reason,
                     "awardedPoints": awarded_points,
+                    **(
+                        {"bankStatementAnalysis": bank_statement_analysis}
+                        if isinstance(bank_statement_analysis, dict)
+                        else {}
+                    ),
                     **({"abaStatementAnalysis":aba_review} if aba_review is not None else {}),
                     "updatedAt": now,
                 },

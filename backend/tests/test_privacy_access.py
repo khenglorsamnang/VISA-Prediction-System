@@ -46,7 +46,7 @@ class Collection:
 
 
 @pytest.fixture
-def case_client(monkeypatch):
+def case_client():
     database = {
         "visaapplications": Collection([
             {"_id": "case-own", "customer": "customer-a", "visaTypeId": "visa-1", "status": "DRAFT"},
@@ -72,10 +72,6 @@ def case_client(monkeypatch):
     async def handle_error(request, error):
         return JSONResponse(status_code=error.status_code, content={"message": error.message})
 
-    async def no_published_profile(database, visa_type_id):
-        return {}
-
-    monkeypatch.setattr(visa_types, "application_profile_fields", no_published_profile)
     with TestClient(app) as client:
         yield client, database, principal
 

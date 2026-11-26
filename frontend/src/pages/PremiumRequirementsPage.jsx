@@ -32,8 +32,6 @@ import {
 import { api } from "./pageUtils";
 import { useTranslation } from "react-i18next";
 import "./RequirementsPage.css";
-import EvidencePolicyPanel from "../components/EvidencePolicyPanel";
-import "../components/Integration.css";
 
 const EMPTY_VISA = {
   countryId: "",
@@ -50,14 +48,22 @@ const EMPTY_REQUIREMENT = {
   name: "",
   required: true,
   conditional: false,
-  weight: 10,
+  weight: "",
+  description: "",
   acceptedFormats: "pdf,jpg,jpeg,png",
   maxFileSize: 10485760,
   displayOrder: 0,
   allowMultiple: false,
+  status: "ACTIVE",
 };
 
 const POINTS_VALIDATION_MESSAGE = "Points must be between 0 and 100.";
+
+const isValidPoints = (value) =>
+  String(value).trim() !== "" &&
+  Number.isFinite(Number(value)) &&
+  Number(value) >= 0 &&
+  Number(value) <= 100;
 
 const PAGE_SIZE = 8;
 const NEW_COUNTRY_DRAFT_ID = "__new_country__";
@@ -144,7 +150,6 @@ function RequirementEditor({
   index,
   onChange,
   onRemove,
-  onPointsExceeded,
   canRemove,
 }) {
   const { t } = useTranslation();
@@ -156,8 +161,10 @@ function RequirementEditor({
           <div className="vreq-input-icon">
             <FileText size={16} aria-hidden="true" />
             <input
+              type="text"
               required
               maxLength={120}
+              aria-label={t("requirementName")}
               value={item.name}
               placeholder={t("validPassportPlaceholder")}
               onChange={(event) => onChange({ ...item, name: event.target.value })}
@@ -171,32 +178,13 @@ function RequirementEditor({
               type="number"
               min="0"
               max="100"
-              step="0.1"
+              step="0.01"
               required
+              aria-label={t("points")}
               value={item.weight}
-              onInvalid={(event) => {
-                const points = event.currentTarget.valueAsNumber;
-                if (points < 0 || points > 100)
-                  event.currentTarget.setCustomValidity(
-                    POINTS_VALIDATION_MESSAGE,
-                  );
-              }}
-              onChange={(event) => {
-                const points = event.currentTarget.valueAsNumber;
-                if (points > 100) {
-                  event.currentTarget.setCustomValidity("");
-                  onPointsExceeded();
-                  onChange({ ...item, weight: 100 });
-                  return;
-                }
-                event.currentTarget.setCustomValidity(
-                  event.currentTarget.value === "" ||
-                    (points >= 0 && points <= 100)
-                    ? ""
-                    : POINTS_VALIDATION_MESSAGE,
-                );
-                onChange({ ...item, weight: event.currentTarget.value });
-              }}
+              onChange={(event) =>
+                onChange({ ...item, weight: event.target.value })
+              }
             />
           </div>
         </Field>
@@ -206,6 +194,48 @@ function RequirementEditor({
             <Trash2 size={16} />
           </button>
         )}
+      </div>
+      <div className="vreq-requirement-details">
+        <Field label="Accepted formats (PDF, JPG, JPEG, PNG)">
+          <input
+            required
+            value={item.acceptedFormats}
+            placeholder="pdf,jpg,jpeg,png"
+            onChange={(event) =>
+              onChange({ ...item, acceptedFormats: event.target.value })
+            }
+          />
+        </Field>
+        <Field label="Requirement status">
+          <select
+            value={item.status || "ACTIVE"}
+            onChange={(event) =>
+              onChange({ ...item, status: event.target.value })
+            }
+          >
+            <option value="ACTIVE">Active</option>
+            <option value="INACTIVE">Inactive</option>
+          </select>
+        </Field>
+        <Field label="Requirement type">
+          <select
+            value={item.required ? "required" : "optional"}
+            onChange={(event) =>
+              onChange({ ...item, required: event.target.value === "required" })
+            }
+          >
+            <option value="required">Required</option>
+            <option value="optional">Optional</option>
+          </select>
+        </Field>
+        <Field label="Additional notes">
+          <input
+            value={item.description || ""}
+            onChange={(event) =>
+              onChange({ ...item, description: event.target.value })
+            }
+          />
+        </Field>
       </div>
     </article>
   );
@@ -222,6 +252,7 @@ export default function PremiumRequirementsPage() {
   const [requirementDrafts, setRequirementDrafts] = useState([
     { ...EMPTY_REQUIREMENT },
   ]);
+  const [editingRequirementIndex, setEditingRequirementIndex] = useState(null);
   const [editingId, setEditingId] = useState("");
   const [selectedVisa, setSelectedVisa] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -375,13 +406,59 @@ export default function PremiumRequirementsPage() {
         (item) => item.status !== "ARCHIVED",
       )
     : [];
+  const activeMaximumPoints = requirementDrafts
+    .filter((item) => !["INACTIVE", "ARCHIVED"].includes(item.status))
+    .reduce((total, item) => total + (Number(item.weight) || 0), 0);
+  const liveRemainingPoints = Math.max(
+    0,
+    100 -
+      requirementDrafts.reduce(
+        (total, item, index) =>
+          index === editingRequirementIndex ||
+          ["INACTIVE", "ARCHIVED"].includes(item.status)
+            ? total
+            : total + (Number(item.weight) || 0),
+        0,
+      ),
+  );
 
   const setDraft = (index, item) =>
-    setRequirementDrafts((current) =>
-      current.map((requirement, itemIndex) =>
+    setRequirementDrafts((current) => {
+      setEditingRequirementIndex(index);
+      const previous = current[index];
+      const next = current.map((requirement, itemIndex) =>
         itemIndex === index ? item : requirement,
-      ),
-    );
+      );
+      if (
+        previous &&
+        (previous.weight !== item.weight || previous.status !== item.status)
+      ) {
+        const otherActivePoints = next.reduce(
+          (total, requirement, itemIndex) =>
+            itemIndex === index ||
+            ["INACTIVE", "ARCHIVED"].includes(requirement.status)
+              ? total
+              : total + (Number(requirement.weight) || 0),
+          0,
+        );
+        const remainingPoints = Math.max(0, 100 - otherActivePoints);
+        if (
+          !isValidPoints(item.weight)
+        ) {
+          notify(POINTS_VALIDATION_MESSAGE, "error");
+        } else if (
+          ["INACTIVE", "ARCHIVED"].includes(item.status)
+            ? false
+            : Number(item.weight) > remainingPoints
+        ) {
+          notify(
+            `Active requirements total cannot exceed 100 points. Remaining points: ${remainingPoints.toFixed(2).replace(/\.00$/, "")}.`,
+            "error",
+          );
+        }
+      }
+      return next;
+    });
 
   const beginEdit = async (visa) => {
     setMenuId("");
@@ -412,12 +489,30 @@ export default function PremiumRequirementsPage() {
       officialSourceUrl: visa.officialSourceUrl || "",
     });
     setRequirementDrafts(items.length ? items : [{ ...EMPTY_REQUIREMENT }]);
+    const invalidExistingPoints = items.filter(
+      (item) => !isValidPoints(item.weight),
+    );
+    const existingActiveTotal = items
+      .filter((item) => !["INACTIVE", "ARCHIVED"].includes(item.status))
+      .reduce((total, item) => total + (Number(item.weight) || 0), 0);
+    if (invalidExistingPoints.length) {
+      notify(
+        "Existing Active requirement points must be between 0 and 100. Please correct them before saving.",
+        "error",
+      );
+    } else if (existingActiveTotal > 100) {
+      notify(
+        `Existing Active requirements exceed 100 points. Remaining points: ${Math.max(0, 100 - existingActiveTotal).toFixed(2).replace(/\.00$/, "")}. Please correct them before saving.`,
+        "error",
+      );
+    }
     setSelectedVisa(null);
     window.setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
   };
 
   const resetForm = () => {
     setEditingId("");
+    setEditingRequirementIndex(null);
     setAddCountryOpen(false);
     setCountryForm({ name: "", isoCode: "", flag: "", nationality: "" });
     setVisaForm(EMPTY_VISA);
@@ -430,23 +525,22 @@ export default function PremiumRequirementsPage() {
       .map((format) => format.trim().toLowerCase().replace(/^\./, ""))
       .filter(Boolean);
     const photo = /photo|photograph/i.test(`${item.name} ${item.code || ""}`);
-    const expectedFormats = photo
-      ? ["jpg", "jpeg", "png"]
-      : ["pdf", "jpg", "jpeg", "png"];
-    if (!photo && (
-      new Set(requestedFormats).size !== expectedFormats.length ||
-      expectedFormats.some((format) => !requestedFormats.includes(format)) ||
-      requestedFormats.some((format) => !expectedFormats.includes(format))
-    )) {
+    const supportedFormats = new Set(["pdf", "jpg", "jpeg", "png"]);
+    if (
+      !requestedFormats.length ||
+      requestedFormats.some((format) => !supportedFormats.has(format)) ||
+      (photo && requestedFormats.includes("pdf"))
+    ) {
       throw new Error(
-        `${item.name}: Supporting documents must accept PDF, JPG, JPEG, and PNG`,
+        `${item.name}: Choose supported formats (PDF, JPG, JPEG, PNG). Photos accept JPG, JPEG, and PNG only.`,
       );
     }
-    const formats = expectedFormats;
+    const formats = [...new Set(requestedFormats)];
     const payload = {
       name: item.name.trim(),
+      description: item.description || "",
       code: item.code || item.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""),
-      weight: Number(item.weight) || 0,
+      weight: Number(item.weight),
       scoringMode: item.scoringMode || "FIXED",
       minimumEarnedPoints: String(item.minimumEarnedPoints ?? 0),
       maximumEarnedPoints: String(item.weight ?? 0),
@@ -465,8 +559,8 @@ export default function PremiumRequirementsPage() {
       required: Boolean(item.required),
       conditional: Boolean(item.conditional),
       acceptedFormats: formats,
-      maxFileSize: Number(item.maxFileSize),
-      displayOrder: Number(item.displayOrder ?? index),
+      maxFileSize: Number(item.maxFileSize) || 10485760,
+      displayOrder: index,
       allowMultiple: Boolean(item.allowMultiple),
       status: item.status || "ACTIVE",
       source: item.source || "",
@@ -496,24 +590,58 @@ export default function PremiumRequirementsPage() {
     if (
       requirementDrafts.some(
         (item) =>
-          !Number.isFinite(Number(item.weight)) ||
-          Number(item.weight) < 0 ||
-          Number(item.weight) > 100,
+          !item.name.trim()
+      )
+    ) {
+      notify(
+        t("completeEachRequirement"),
+        "error",
+      );
+      return;
+    }
+    if (
+      requirementDrafts.some(
+        (item) => !isValidPoints(item.weight),
       )
     ) {
       notify(POINTS_VALIDATION_MESSAGE, "error");
       return;
     }
-    if (
-      requirementDrafts.some(
-        (item) =>
-          !item.name.trim() ||
-          !Number.isInteger(Number(item.displayOrder)) ||
-          Number(item.displayOrder) < 0,
-      )
-    ) {
+    const activeMaximumPoints = requirementDrafts
+      .filter((item) => !["INACTIVE", "ARCHIVED"].includes(item.status))
+      .reduce((total, item) => total + (Number(item.weight) || 0), 0);
+    if (activeMaximumPoints > 100) {
+      const offendingIndex = requirementDrafts.findIndex((item, index) => {
+        if (["INACTIVE", "ARCHIVED"].includes(item.status)) return false;
+        const otherActivePoints = requirementDrafts.reduce(
+          (total, other, otherIndex) =>
+            otherIndex === index ||
+            ["INACTIVE", "ARCHIVED"].includes(other.status)
+              ? total
+              : total + (Number(other.weight) || 0),
+          0,
+        );
+        return Number(item.weight) > 100 - otherActivePoints;
+      });
+      const offendingItem = offendingIndex >= 0
+        ? requirementDrafts[offendingIndex]
+        : null;
+      const remainingPoints = offendingItem
+        ? Math.max(
+            0,
+            100 -
+              requirementDrafts.reduce(
+                (total, item, index) =>
+                  index === offendingIndex ||
+                  ["INACTIVE", "ARCHIVED"].includes(item.status)
+                    ? total
+                    : total + (Number(item.weight) || 0),
+                0,
+              ),
+          )
+        : 0;
       notify(
-        t("completeEachRequirement"),
+        `Active requirements total cannot exceed 100 points. Remaining points: ${remainingPoints.toFixed(2).replace(/\.00$/, "")}.`,
         "error",
       );
       return;
@@ -1038,7 +1166,7 @@ export default function PremiumRequirementsPage() {
           <div className="vreq-requirement-heading">
             <div>
               <h3>{t("documentRequirements")}</h3>
-              <p>{t("verifiedPolicyOnly")}</p>
+              <p>Changes apply to new applications. Existing cases keep their saved scoring snapshot until explicitly recalculated.</p>
             </div>
             <button
               type="button"
@@ -1061,9 +1189,6 @@ export default function PremiumRequirementsPage() {
                 index={index}
                 canRemove={requirementDrafts.length > 1}
                 onChange={(next) => setDraft(index, next)}
-                onPointsExceeded={() =>
-                  notify(POINTS_VALIDATION_MESSAGE, "error")
-                }
                 onRemove={() =>
                   setRequirementDrafts((current) =>
                     current.filter((_, itemIndex) => itemIndex !== index),
@@ -1071,6 +1196,12 @@ export default function PremiumRequirementsPage() {
                 }
               />
             ))}
+          </div>
+          <div className="vreq-point-summary">
+            <span>Active maximum points</span>
+            <strong>
+              {activeMaximumPoints.toFixed(2).replace(/\.00$/, "")} / 100 · Remaining: {liveRemainingPoints.toFixed(2).replace(/\.00$/, "")}
+            </strong>
           </div>
 
           <Field label={t("additionalNotes")} className="vreq-notes-field">
@@ -1108,7 +1239,6 @@ export default function PremiumRequirementsPage() {
           </div>
         </form>
       </section>
-      <details className="workspace-policy-disclosure"><summary>Scoring policies and published versions</summary><EvidencePolicyPanel visaTypes={visaTypes} requirements={requirements}/></details>
 
 
       <section className="vreq-list-card">

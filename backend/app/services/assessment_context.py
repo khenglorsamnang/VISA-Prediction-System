@@ -40,7 +40,14 @@ def policy_snapshot(application: dict[str, Any]) -> dict[str, Any] | None:
 
 def application_requirements(application: dict[str, Any], current: list[dict[str, Any]]) -> list[dict[str, Any]]:
     snapshot = policy_snapshot(application)
-    rows = snapshot["requirements"] if snapshot is not None else current
+    application_snapshot = application.get("requirementSnapshot")
+    rows = (
+        snapshot["requirements"]
+        if snapshot is not None
+        else application_snapshot
+        if isinstance(application_snapshot, list) and application_snapshot
+        else current
+    )
     return [{**row, "requirementId": str(row.get("requirementId") or row.get("_id") or "")} for row in rows]
 
 
@@ -96,5 +103,5 @@ def bank_verified_for_prediction(document):
     if not isinstance(aba, dict):
         return True  # legacy documents retain legacy-model compatibility
     return (aba.get("reconciliationStatus") == "RECONCILED" and aba.get("reviewStatus") == "VERIFIED"
-            and aba.get("ownerRelationshipConfirmed") is True and aba.get("statementStrengthScore") is not None
+            and aba.get("statementStrengthScore") is not None
             and not aba.get("issues"))

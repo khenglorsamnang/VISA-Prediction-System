@@ -5,6 +5,32 @@ const businessApiBase = import.meta.env.VITE_API_BASE_URL || "/api";
 const aiApiBase =
   import.meta.env.VITE_AI_API_BASE_URL || "http://127.0.0.1:8002";
 
+export const BANK_STATEMENT_MAX_FILE_SIZE = 50 * 1024 * 1024;
+
+export function isBankStatementRequirement(requirement = {}) {
+  return [requirement.code, requirement.requirementCode, requirement.name]
+    .filter(Boolean)
+    .some((value) =>
+      String(value)
+        .toLowerCase()
+        .replace(/[\s-]+/g, "_")
+        .includes("bank_statement"),
+    );
+}
+
+export function getRequirementMaxFileSize(
+  requirement,
+  hardLimit = Number.POSITIVE_INFINITY,
+) {
+  if (isBankStatementRequirement(requirement)) {
+    return BANK_STATEMENT_MAX_FILE_SIZE;
+  }
+  return Math.min(
+    Number(requirement?.maxFileSize) || 10 * 1024 * 1024,
+    hardLimit,
+  );
+}
+
 function normalizeBaseUrl(baseUrl, includeApiPrefix) {
   const normalized = baseUrl.replace(/\/+$/, "");
   if (!includeApiPrefix || normalized.endsWith("/api")) {

@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import calendar
 import heapq
+import math
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from .financial_analysis import calculate_financial_analysis
-from .identity_normalization import name_tokens
 from .transaction_normalization import normalize_transactions, parse_amount
 
+
+SOURCE_UNVERIFIED_PENALTY_POINTS = 0.5
 
 REQUIRED_BANK_FIELDS = (
     "bankName",
@@ -30,16 +32,119 @@ REQUIRED_BANK_FIELDS = (
 DEFAULT_BANK_STATEMENT_SCORING: dict[str, Any] = {
     "minimum_monthly_closing_balance_usd": 4000,
     "full_balance_score_usd": 8000,
+    "money_in_flag_threshold_usd": 2000,
+    "money_out_flag_threshold_usd": 1000,
+    "money_in_flag_deduction_percent": 0,
+    "money_out_flag_deduction_percent": 0,
+    "monthly_low_balance_flag_deduction_percent": 0,
+    "minimum_statement_period_days": 90,
+    "ending_balance_recent_withdrawal_days": 7,
+    "historical_pattern_deviation_ratio": 2.0,
     "recent_large_deposit_days": 30,
     "rapid_funds_outflow_days": 7,
     "rapid_funds_outflow_ratio": 0.8,
+    "unverified_source_penalty_points": SOURCE_UNVERIFIED_PENALTY_POINTS,
+    "deduct_pending_source_review": False,
+    "maximum_transaction_history_penalty": 9.0,
+    "require_source_evidence_for_confirmation": True,
+    "minimum_source_review_notes_length": 8,
+    "staff_review_threshold_usd": 1000,
+    "staff_review_exchange_rates_to_usd": {"USD": 1.0},
     "weights": {
-        "three_month_balance_stability": 20,
-        "transaction_history_quality": 15,
-        "source_of_funds_consistency": 10,
-        "document_completeness_consistency": 5,
+        "ending_balance": 22.5,
+        "starting_balance": 6.75,
+        "transaction_history": 9.0,
+        "transaction_period": 6.75,
     },
 }
+
+
+def calculate_bank_statement_score(
+    components: dict[str, Any],
+    *,
+    weights: dict[str, Any] | None = None,
+    ocr_complete: bool = True,
+    score_available: bool = True,
+) -> dict[str, Any]:
+    """Normalize four category scores and calculate their single 45-point total."""
+    score_weights = (
+        DEFAULT_BANK_STATEMENT_SCORING["weights"] if weights is None else weights
+    )
+    if set(score_weights) != set(DEFAULT_BANK_STATEMENT_SCORING["weights"]):
+        raise ValueError("Bank statement score weights must define all four components.")
+    normalized_components: dict[str, dict[str, Any]] = {}
+    all_components_available = True
+    available_maximum = 0.0
+    for key, configured_maximum in score_weights.items():
+        maximum = float(configured_maximum)
+        item = components.get(key)
+        item = item if isinstance(item, dict) else {}
+        raw_points = item.get("points")
+        raw_maximum = item.get("maximum")
+        try:
+            points = (
+                None
+                if isinstance(raw_points, bool) or raw_points is None
+                else float(raw_points)
+            )
+            stored_maximum = (
+                None
+                if isinstance(raw_maximum, bool) or raw_maximum is None
+                else float(raw_maximum)
+            )
+        except (TypeError, ValueError):
+            points = None
+            stored_maximum = None
+        category_available = (
+            ocr_complete
+            and bool(item.get("available", points is not None))
+            and points is not None
+            and math.isfinite(points)
+            and stored_maximum == maximum
+        )
+        normalized_points = (
+            round(min(max(points, 0.0), maximum), 2)
+            if category_available and points is not None
+            else None
+        )
+        normalized_components[key] = {
+            **item,
+            "points": normalized_points,
+            "maximum": maximum,
+            "available": category_available,
+        }
+        all_components_available = all_components_available and category_available
+        if category_available:
+            available_maximum += maximum
+
+    maximum = sum(float(value) for value in score_weights.values())
+    available = ocr_complete and score_available and all_components_available
+    points = (
+        round(
+            min(
+                maximum,
+                max(
+                    0.0,
+                    sum(
+                        float(item["points"])
+                        for item in normalized_components.values()
+                    ),
+                ),
+            ),
+            2,
+        )
+        if available
+        else None
+    )
+    return {
+        "points": points,
+        "maximum": maximum,
+        "percentage": round(points / maximum * 100, 2) if points is not None else None,
+        "available": available,
+        "availableMaximumPoints": round(available_maximum, 2),
+        "components": normalized_components,
+    }
+
 
 _BANK_FIELD_ALIASES = {
     "bankName": ("bank_name", "bank"),
@@ -105,6 +210,1353 @@ def calculate_document_verification_score(
     }
 
 
+_SOURCE_REVIEW_FLAG_CODES = {
+    "LARGE_DEPOSIT_SOURCE_REVIEW",
+    "RECENT_LARGE_DEPOSIT",
+    "TRANSFER_REVIEW",
+    "RAPID_FUNDS_OUTFLOW",
+    "FREQUENT_UNEXPLAINED_DEPOSITS",
+    "MISSING_COUNTERPARTY",
+    "HISTORICAL_PATTERN_DEVIATION",
+    "TRANSACTION_CURRENCY_MISMATCH",
+}
+
+
+def _transaction_reference(transaction: dict[str, Any]) -> str | None:
+    for key in ("referenceNumber", "reference_number", "reference"):
+        value = transaction.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _transaction_identity(transaction: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": transaction.get("date"),
+        "amount": transaction.get("amount"),
+        "currency": transaction.get("currency"),
+        "direction": transaction.get("direction"),
+        "description": transaction.get("description"),
+        "reference": _transaction_reference(transaction),
+    }
+
+
+def analyze_bank_statement(
+    fields: dict[str, Any],
+    *,
+    raw_text: str = "",
+    applicant_name: str = "",
+    config: dict[str, Any] | None = None,
+    financial_config: dict[str, Any] | None = None,
+    ocr_complete: bool = True,
+    transaction_source_reviews: dict[str, dict[str, Any]] | None = None,
+    document_id: str | None = None,
+) -> dict[str, Any]:
+    """Score the four bank-evidence components from available points and flags."""
+    policy = {**DEFAULT_BANK_STATEMENT_SCORING, **(config or {})}
+    weights = policy.get("weights", DEFAULT_BANK_STATEMENT_SCORING["weights"])
+    if weights != DEFAULT_BANK_STATEMENT_SCORING["weights"]:
+        raise ValueError(
+            "Bank statement score weights must be Ending Balance 22.50, "
+            "Starting Balance 6.75, Transaction History 9.00, and "
+            "Transaction Period 6.75."
+        )
+    result = _analyze_bank_statement_base(
+        fields,
+        raw_text=raw_text,
+        applicant_name=applicant_name,
+        config=policy,
+        financial_config=financial_config,
+        ocr_complete=ocr_complete,
+    )
+    normalized_fields = normalize_bank_fields(fields)
+    statement_start = _date(normalized_fields.get("statementStartDate"))
+    end = _date(normalized_fields.get("statementEndDate"))
+    statement_period = result.get("statementPeriod") or {}
+    start = _date(statement_period.get("scoringStartDate")) or statement_start
+    evaluated_months = set(statement_period.get("monthsEvaluated") or [])
+
+    def transaction_date(item: dict[str, Any]) -> date | None:
+        return _date(item.get("date") or item.get("transactionDate"))
+
+    def transaction_in_period(item: dict[str, Any]) -> bool:
+        tx_date = transaction_date(item)
+        return tx_date is None or bool(start and end and start <= tx_date <= end)
+
+    transactions = result.get("transactions") or []
+    period_transactions = [
+        item
+        for item in transactions
+        if isinstance(item, dict) and transaction_in_period(item)
+    ]
+    historical_source = (
+        normalized_fields.get("historicalTransactionHistory")
+        or normalized_fields.get("historical_transaction_history")
+        or []
+    )
+    historical_transactions = normalize_transactions(
+        historical_source,
+        default_currency=normalized_fields.get("currency"),
+    )["transactions"]
+    historical_dates = [
+        _date(item.get("date"))
+        for item in historical_transactions
+        if item.get("extraction_status") == "VALID" and item.get("date")
+    ]
+    current_valid_count = sum(
+        item.get("extraction_status") == "VALID"
+        and item.get("date") is not None
+        and item.get("amount") is not None
+        and item.get("direction") in {"credit", "debit"}
+        and item.get("currency") == result.get("accountInformation", {}).get("currency")
+        and transaction_in_period(item)
+        for item in transactions
+        if isinstance(item, dict)
+    )
+    current_month_count = (
+        len(evaluated_months)
+        if statement_period.get("completeThreeMonths") and evaluated_months
+        else None
+    )
+    historical_month_count = (
+        max(1, (max(historical_dates).year - min(historical_dates).year) * 12
+            + max(historical_dates).month - min(historical_dates).month + 1)
+        if historical_dates
+        else None
+    )
+    historical_pattern_ratio = None
+    if historical_month_count and current_month_count:
+        historical_frequency = len(historical_dates) / historical_month_count
+        current_frequency = current_valid_count / current_month_count
+        if historical_frequency == 0:
+            historical_pattern_ratio = float("inf") if current_frequency > 0 else 1.0
+        elif current_frequency == 0:
+            historical_pattern_ratio = float("inf")
+        else:
+            historical_pattern_ratio = max(
+                historical_frequency / current_frequency,
+                current_frequency / historical_frequency,
+            )
+        if historical_pattern_ratio >= float(policy["historical_pattern_deviation_ratio"]):
+            for index, transaction in enumerate(transactions):
+                if not isinstance(transaction, dict) or not transaction_in_period(transaction):
+                    continue
+                result.setdefault("riskFlags", []).append(
+                    {
+                        "code": "HISTORICAL_PATTERN_DEVIATION",
+                        "reason": "Transaction frequency differs materially from the supplied historical transaction evidence; request context.",
+                        "severity": "medium",
+                        "manualReviewRequired": True,
+                        "transactionIndex": index,
+                        "date": transaction.get("date"),
+                        "amount": transaction.get("amount"),
+                        "currency": transaction.get("currency"),
+                        "description": transaction.get("description"),
+                        "page": transaction.get("page"),
+                        "referenceNumber": transaction.get("referenceNumber"),
+                    }
+                )
+    result["historicalPatternAssessment"] = {
+        "status": "AVAILABLE" if historical_month_count else "INSUFFICIENT_DATA",
+        "historicalTransactionCount": len(historical_dates),
+        "historicalPeriodMonths": historical_month_count,
+        "currentTransactionCount": current_valid_count,
+        "currentPeriodMonths": current_month_count,
+        "deviationRatio": (
+            historical_pattern_ratio
+            if historical_pattern_ratio is None or historical_pattern_ratio != float("inf")
+            else None
+        ),
+        "significantDeviation": bool(
+            historical_pattern_ratio is not None
+            and historical_pattern_ratio >= float(policy["historical_pattern_deviation_ratio"])
+        ),
+        "thresholdRatio": float(policy["historical_pattern_deviation_ratio"]),
+    }
+    required_balance = float(policy["minimum_monthly_closing_balance_usd"])
+    period_days = int(policy["minimum_statement_period_days"])
+    scoring_currency = result.get("accountInformation", {}).get("currency")
+    valid_transactions = [
+        (index, item)
+        for index, item in enumerate(transactions)
+        if isinstance(item, dict)
+        and item.get("extraction_status") == "VALID"
+        and item.get("date")
+        and item.get("running_balance") is not None
+        and item.get("currency") == scoring_currency
+        and (not start or item["date"] >= start.isoformat())
+        and (not end or item["date"] <= end.isoformat())
+    ]
+    latest_monthly_check = next(
+        (
+            item
+            for item in reversed(result.get("monthlyBalanceChecks") or [])
+            if end and item.get("month") == end.strftime("%Y-%m")
+        ),
+        None,
+    )
+    latest_closing_verified = bool(
+        statement_period.get("completeThreeMonths")
+        and latest_monthly_check
+        and not latest_monthly_check.get("ambiguous")
+        and latest_monthly_check.get("closingBalance") is not None
+        and latest_monthly_check.get("currency") == scoring_currency
+    )
+    period_opening = result.get("periodOpeningBalance")
+    period_closing = (
+        latest_monthly_check.get("closingBalance")
+        if latest_closing_verified
+        else None
+    )
+    result["accountInformation"]["openingBalance"] = period_opening
+    result["accountInformation"]["closingBalance"] = period_closing
+    dated_period_transactions = [
+        item
+        for item in transactions
+        if isinstance(item, dict)
+        and (tx_date := transaction_date(item)) is not None
+        and start
+        and end
+        and start <= tx_date <= end
+    ]
+    period_financial_fields = {
+        **normalized_fields,
+        "statementStartDate": start.isoformat() if start else None,
+        "statementEndDate": end.isoformat() if end else None,
+        "openingBalance": period_opening,
+        "closingBalance": period_closing,
+        "averageBalance": None,
+        "deposits": (
+            normalized_fields.get("deposits")
+            if statement_start == start
+            else None
+        ),
+        "withdrawals": (
+            normalized_fields.get("withdrawals")
+            if statement_start == start
+            else None
+        ),
+    }
+    period_financial_analysis = calculate_financial_analysis(
+        period_financial_fields,
+        dated_period_transactions,
+        financial_config,
+    )
+    if not ocr_complete:
+        period_financial_analysis = {
+            **period_financial_analysis,
+            "financial_score": None,
+            "status": "manual_review",
+            "human_review_required": True,
+        }
+    period_reconciliation = period_financial_analysis.get("reconciliation") or {}
+    has_undated_transactions = any(
+        isinstance(item, dict) and transaction_date(item) is None
+        for item in transactions
+    )
+    if (
+        not statement_period.get("completeThreeMonths")
+        or result.get("periodOpeningBalanceAmbiguous")
+        or period_closing is None
+        or has_undated_transactions
+    ):
+        period_reconciliation = {
+            **period_reconciliation,
+            "status": "not_available",
+            "statusLabel": "NOT_AVAILABLE",
+            "delta": None,
+        }
+    result["financialAnalysis"] = period_financial_analysis
+    result["reconciliation"] = {
+        **period_reconciliation,
+        "status": period_reconciliation.get("statusLabel", "NOT_AVAILABLE"),
+        "legacyStatus": period_reconciliation.get("status"),
+    }
+    scoped_risk_flags = []
+    for flag in result.get("riskFlags", []):
+        index = flag.get("transactionIndex")
+        if isinstance(index, int) and (
+            index >= len(transactions)
+            or not isinstance(transactions[index], dict)
+            or not transaction_in_period(transactions[index])
+        ):
+            continue
+        flag_month = flag.get("month")
+        if (
+            flag_month
+            and flag.get("code")
+            in {
+                "CONFLICTING_MONTHLY_BALANCES",
+                "CONFLICTING_MONTHLY_OPENING_BALANCES",
+                "MONTHLY_BALANCE_CONTINUITY_MISMATCH",
+            }
+            and flag_month not in evaluated_months
+        ):
+            continue
+        scoped_risk_flags.append(flag)
+    result["riskFlags"] = scoped_risk_flags
+    reconciliation_flags = {
+        "RECONCILIATION_MISMATCH",
+        "RECONCILIATION_INSUFFICIENT_DATA",
+    }
+    result["riskFlags"] = [
+        flag
+        for flag in result.get("riskFlags", [])
+        if flag.get("code") not in reconciliation_flags
+    ]
+    if result["reconciliation"]["status"] == "MISMATCHED":
+        result["riskFlags"].append(
+            {
+                "code": "RECONCILIATION_MISMATCH",
+                "reason": "The opening balance plus in-period credits minus in-period debits differs from the period-end closing balance.",
+                "severity": "medium",
+                "manualReviewRequired": True,
+                "expectedClosingBalance": period_reconciliation.get(
+                    "expected_closing_balance"
+                ),
+                "extractedClosingBalance": period_closing,
+                "difference": period_reconciliation.get("delta"),
+            }
+        )
+    elif result["reconciliation"]["status"] == "NOT_AVAILABLE":
+        result["riskFlags"].append(
+            {
+                "code": "RECONCILIATION_INSUFFICIENT_DATA",
+                "reason": "The complete three-month period cannot be reconciled from its boundary balances and dated transactions.",
+                "severity": "low",
+                "manualReviewRequired": True,
+            }
+        )
+    result["reviewFlags"] = result["riskFlags"]
+    result["reviewReasons"] = list(
+        dict.fromkeys(flag["reason"] for flag in result["riskFlags"])
+    )
+    result["status"] = (
+        "CONSISTENCY_CHECK_PASSED"
+        if ocr_complete
+        and result.get("financialRequirementStatus") == "PASS"
+        and not result["riskFlags"]
+        else "NEEDS_MANUAL_REVIEW"
+    )
+
+    def component(
+        key: str,
+        ratio: float | None,
+        explanation: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        maximum = float(weights[key])
+        bounded = max(0.0, min(1.0, ratio)) if ratio is not None else None
+        return {
+            "points": round(maximum * bounded, 2) if bounded is not None else None,
+            "maximum": maximum,
+            "available": bounded is not None,
+            "evidence_ratio": round(bounded, 4) if bounded is not None else None,
+            "explanation": explanation,
+            "evidence": evidence,
+        }
+
+    ending_component: dict[str, Any]
+    ending_evidence: dict[str, Any] = {
+        "requiredMinimum": required_balance,
+        "currency": scoring_currency,
+        "basis": "closing balance at the end of the latest complete three-month period",
+        "scoringStartDate": start.isoformat() if start else None,
+        "scoringEndDate": end.isoformat() if end else None,
+    }
+    if latest_closing_verified and scoring_currency == "USD":
+        final_balance = float(latest_monthly_check["closingBalance"])
+        balance_ratio = max(0.0, min(1.0, final_balance / required_balance))
+        recent_withdrawals = sum(
+            abs(float(item.get("amount") or 0))
+            for item in period_transactions
+            if item.get("direction") == "debit"
+            and item.get("date")
+            and end
+            and 0 <= (end - _date(item["date"])).days <= int(policy["ending_balance_recent_withdrawal_days"])
+        )
+        retention_ratio = (
+            max(0.0, final_balance) / (max(0.0, final_balance) + recent_withdrawals)
+            if final_balance > 0 or recent_withdrawals > 0
+            else 0.0
+        ) if valid_transactions else None
+        reconciliation_status = str(result.get("reconciliation", {}).get("status") or "")
+        reconciliation_ratio = (
+            1.0 if reconciliation_status in {"RECONCILED", "MATCHED"}
+            else 0.0 if reconciliation_status in {"MISMATCHED", "MISMATCH"}
+            else None
+        )
+        supported_weight = 0.65
+        ratio = 0.65 * balance_ratio
+        if retention_ratio is not None:
+            supported_weight += 0.2
+            ratio += 0.2 * retention_ratio
+        if reconciliation_ratio is not None:
+            supported_weight += 0.15
+            ratio += 0.15 * reconciliation_ratio
+        ending_evidence.update(
+            {
+                "latestMonth": latest_monthly_check["month"],
+                "latestVerifiedClosingBalance": final_balance,
+                "closingBalanceSource": latest_monthly_check.get("source"),
+                "closingBalanceSourcePage": latest_monthly_check.get("sourcePage"),
+                "balanceSufficiencyRatio": round(balance_ratio, 4),
+                "recentWithdrawalTotal": round(recent_withdrawals, 2),
+                "balanceRetentionRatio": (
+                    round(retention_ratio, 4)
+                    if retention_ratio is not None
+                    else None
+                ),
+                "reconciliationStatus": reconciliation_status or "INSUFFICIENT_DATA",
+                "reconciliationRatio": reconciliation_ratio,
+                "supportedWeightRatio": round(supported_weight, 4),
+                "supportedMaximumPoints": round(
+                    float(weights["ending_balance"]) * supported_weight, 2
+                ),
+            }
+        )
+        ending_component = component(
+            "ending_balance",
+            ratio,
+            "Uses the actual closing balance at the end of the latest complete three-month period, with in-period withdrawal and reconciliation evidence. Earlier monthly balances are used only to detect conflicts.",
+            ending_evidence,
+        )
+    else:
+        ending_component = component(
+            "ending_balance",
+            None,
+            (
+                "INSUFFICIENT_DATA: the latest month's verified closing balance is missing, conflicting, or unavailable."
+                if not latest_closing_verified
+                else "INSUFFICIENT_DATA: a verified USD conversion is unavailable for this statement currency."
+            ),
+            ending_evidence,
+        )
+
+    opening = result.get("periodOpeningBalance")
+    starting_balance_ratio = (
+        max(0.0, min(1.0, opening / required_balance))
+        if opening is not None
+        and start is not None
+        and not result.get("periodOpeningBalanceAmbiguous")
+        and required_balance > 0
+        and scoring_currency == "USD"
+        else None
+    )
+    funding_source = normalized_fields.get("initialFundingSource")
+    funding_evidence = normalized_fields.get("initialFundingSourceEvidence")
+    if isinstance(funding_source, dict):
+        funding_evidence = funding_source.get("evidence") or funding_evidence
+        funding_source = funding_source.get("source") or funding_source.get("description")
+    funding_source_available = bool(
+        str(funding_source or "").strip() and str(funding_evidence or "").strip()
+    )
+    starting_supported_weight = 0.0
+    starting_ratio = None
+    if starting_balance_ratio is not None:
+        starting_supported_weight = 0.8
+        starting_ratio = 0.8 * starting_balance_ratio
+        if funding_source_available:
+            starting_supported_weight += 0.2
+            starting_ratio += 0.2
+    account_opening_date = _date(
+        normalized_fields.get("accountOpeningDate")
+        or normalized_fields.get("account_opening_date")
+    )
+    starting_component = component(
+        "starting_balance",
+        starting_ratio,
+        (
+            "Based on the actual opening balance at the beginning of the latest complete three-month period and the documented initial-funding evidence. "
+            "Monthly balances are not averaged into this category."
+            if starting_ratio is not None
+            else "INSUFFICIENT_DATA: statement opening balance or start date is unavailable."
+        ),
+        {
+            "statementStartDate": start.isoformat() if start else None,
+            "openingBalance": opening,
+            "requiredMinimum": required_balance,
+            "scoringEndDate": end.isoformat() if end else None,
+            "openingBalanceEvidence": result.get("periodOpeningBalanceEvidence") or [],
+            "openingBalanceConflict": bool(
+                result.get("periodOpeningBalanceAmbiguous")
+            ),
+            "initialFundingSource": funding_source if funding_source_available else None,
+            "initialFundingSourceEvidence": funding_evidence if funding_source_available else None,
+            "supportedWeightRatio": round(starting_supported_weight, 4),
+            "supportedMaximumPoints": round(
+                float(weights["starting_balance"]) * starting_supported_weight, 2
+            ),
+            "accountOpeningDate": account_opening_date.isoformat() if account_opening_date else None,
+            "accountAgeStatus": "AVAILABLE" if account_opening_date else "INSUFFICIENT_DATA",
+        },
+    )
+
+    total_rows = len(period_transactions)
+    valid_history_transactions = [
+        item
+        for item in period_transactions
+        if isinstance(item, dict)
+        and item.get("extraction_status") == "VALID"
+        and item.get("date") is not None
+        and (not start or item["date"] >= start.isoformat())
+        and (not end or item["date"] <= end.isoformat())
+        and item.get("amount") is not None
+        and item.get("direction") in {"credit", "debit"}
+        and item.get("currency") == result.get("accountInformation", {}).get("currency")
+    ]
+    complete_rows = len(valid_history_transactions)
+    history_ratio = complete_rows / total_rows if total_rows else None
+    reconciliation_status = str(
+        result.get("reconciliation", {}).get("status") or ""
+    ).upper()
+    period_transaction_indices = {
+        index
+        for index, item in enumerate(transactions)
+        if isinstance(item, dict) and transaction_in_period(item)
+    }
+    duplicate_count = sum(
+        duplicate.get("transactionIndex") in period_transaction_indices
+        for duplicate in result.get("duplicateTransactions") or []
+    )
+    if history_ratio is not None:
+        if reconciliation_status in {"MISMATCHED", "MISMATCH"}:
+            history_ratio *= 0.5
+        if duplicate_count:
+            history_ratio *= max(
+                0.0,
+                1.0 - duplicate_count / total_rows,
+            )
+
+    review_map = transaction_source_reviews or {}
+    source_reviews: dict[str, dict[str, Any]] = {}
+    status_aliases = {
+        "SOURCE_CONFIRMED": "CONFIRMED",
+        "SOURCE_UNVERIFIED": "UNVERIFIED",
+    }
+    for key, review in review_map.items():
+        if not isinstance(review, dict):
+            continue
+        status = str(review.get("status") or "PENDING_REVIEW").upper()
+        status = status_aliases.get(status, status)
+        if status in {"CONFIRMED", "UNVERIFIED", "PENDING_REVIEW"}:
+            source_reviews[str(key)] = {**review, "status": status}
+    risk_indicators: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for flag in result.get("riskFlags", []):
+        index = flag.get("transactionIndex")
+        if flag.get("code") not in _SOURCE_REVIEW_FLAG_CODES or not isinstance(index, int):
+            continue
+        if (
+            index >= len(transactions)
+            or not isinstance(transactions[index], dict)
+            or not transaction_in_period(transactions[index])
+        ):
+            continue
+        risk_indicators[index].append(
+            {"code": flag["code"], "severity": flag.get("severity"), "reason": flag.get("reason")}
+        )
+    threshold_usd = float(policy.get("staff_review_threshold_usd", 1000))
+    exchange_rates = policy.get("staff_review_exchange_rates_to_usd") or {"USD": 1.0}
+    if not isinstance(exchange_rates, dict):
+        exchange_rates = {"USD": 1.0}
+    default_penalty = SOURCE_UNVERIFIED_PENALTY_POINTS
+    minimum_balance_threshold = float(
+        policy["minimum_monthly_closing_balance_usd"]
+    )
+
+    def transaction_balance_evidence(
+        transaction: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        balance_value = next(
+            (
+                transaction.get(key)
+                for key in (
+                    "running_balance",
+                    "runningBalance",
+                    "balance",
+                    "availableBalance",
+                    "available_balance",
+                    "ledgerBalance",
+                    "ledger_balance",
+                )
+                if transaction.get(key) not in (None, "")
+            ),
+            None,
+        )
+        amount = _number(balance_value)
+        if amount is None:
+            return None
+        currency = _currency(
+            transaction.get("balanceCurrency")
+            or transaction.get("balance_currency")
+            or transaction.get("currency")
+            or scoring_currency
+        )
+        rate = _transaction_exchange_rate_to_usd(currency, exchange_rates)
+        if rate is None:
+            return None
+        return {
+            "amount": amount,
+            "currency": currency,
+            "amountUsd": round(amount * rate, 2),
+        }
+
+    review_candidates: dict[int, dict[str, Any]] = {}
+    for index, transaction in enumerate(transactions):
+        if not isinstance(transaction, dict):
+            continue
+        tx_date = transaction_date(transaction)
+        if tx_date is None or not start or not end or not start <= tx_date <= end:
+            continue
+        amount = _number(transaction.get("amount"))
+        currency = _currency(transaction.get("currency"))
+        rate = _transaction_exchange_rate_to_usd(currency, exchange_rates)
+        if amount is None or rate is None:
+            continue
+        amount_usd = round(abs(amount) * rate, 2)
+        balance_evidence = transaction_balance_evidence(transaction)
+        if (
+            amount_usd < threshold_usd
+            and not risk_indicators.get(index)
+            and str(index) not in source_reviews
+        ):
+            continue
+        review_candidates[index] = {
+            "transactionIndex": index,
+            "date": transaction.get("date"),
+            "amount": abs(amount),
+            "currency": currency,
+            "amountUsd": amount_usd,
+            "balance": (
+                balance_evidence["amount"]
+                if balance_evidence is not None
+                else None
+            ),
+            "balanceCurrency": (
+                balance_evidence["currency"] if balance_evidence is not None else None
+            ),
+            "balanceUsd": (
+                balance_evidence["amountUsd"] if balance_evidence is not None else None
+            ),
+            "exchangeRateToUsd": rate,
+            "staffReviewThresholdUsd": threshold_usd,
+            "requiresStaffReview": True,
+            "direction": transaction.get("direction"),
+            "description": transaction.get("description"),
+            "sender": transaction.get("sender"),
+            "receiver": transaction.get("receiver"),
+            "counterparty": transaction.get("counterparty"),
+            "sourceEvidence": transaction.get("evidence") or transaction.get("sourceText"),
+            "page": transaction.get("page"),
+            "reference": _transaction_reference(transaction),
+            "riskIndicators": risk_indicators.get(index, []),
+        }
+    for index, candidate in review_candidates.items():
+        review = source_reviews.get(str(index), {})
+        current_identity = _transaction_identity(transactions[index])
+        if review.get("transactionIdentity") and review["transactionIdentity"] != current_identity:
+            review = {}
+        candidate.update(
+            {
+                "status": review.get("status", "PENDING_REVIEW"),
+                "reviewStatus": {
+                    "CONFIRMED": "SOURCE_CONFIRMED",
+                    "UNVERIFIED": "SOURCE_UNVERIFIED",
+                }.get(review.get("status", "PENDING_REVIEW"), "PENDING_REVIEW"),
+                "sourceCategory": review.get("sourceCategory"),
+                "sourceCategoryLabel": review.get("sourceCategoryLabel"),
+                "reviewerId": review.get("reviewerId"),
+                "reviewedAt": review.get("reviewedAt"),
+                "evidenceReferences": review.get("evidenceReferences", []),
+                "reviewNotes": review.get("notes"),
+                "reviewHistory": review.get("decisionHistory", []),
+                "requestedEvidence": review.get("requestedEvidence"),
+            }
+        )
+
+    scoring_document_id = str(
+        document_id
+        or normalized_fields.get("documentId")
+        or normalized_fields.get("document_id")
+        or ""
+    )
+    dedup_document_id = scoring_document_id or "UNSPECIFIED_DOCUMENT"
+    duplicate_aliases = {
+        int(item["transactionIndex"]): int(item["duplicateOfIndex"])
+        for item in result.get("duplicateTransactions") or []
+        if isinstance(item, dict)
+        and isinstance(item.get("transactionIndex"), int)
+        and isinstance(item.get("duplicateOfIndex"), int)
+    }
+
+    def transaction_identifier(index: int, transaction: dict[str, Any]) -> str:
+        reference = _transaction_reference(transaction)
+        if reference:
+            return f"reference:{reference}"
+        explicit_id = (
+            transaction.get("transactionId")
+            or transaction.get("transaction_id")
+            or transaction.get("id")
+        )
+        if explicit_id is not None and str(explicit_id).strip():
+            return f"transaction:{str(explicit_id).strip()}"
+        canonical_index = index
+        visited: set[int] = set()
+        while canonical_index in duplicate_aliases and canonical_index not in visited:
+            visited.add(canonical_index)
+            canonical_index = duplicate_aliases[canonical_index]
+        return f"transaction-index:{canonical_index}"
+
+    scoring_flags_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def add_scoring_flag(
+        flag_type: str,
+        component_key: str,
+        transaction_id: str,
+        reason: str,
+        deduction_type: str,
+        configured_deduction: float,
+        **details: Any,
+    ) -> None:
+        deduplication_key = (
+            dedup_document_id,
+            transaction_id,
+            flag_type,
+        )
+        if deduplication_key in scoring_flags_by_key:
+            return
+        scoring_flags_by_key[deduplication_key] = {
+            "documentId": scoring_document_id or None,
+            "transactionId": transaction_id,
+            "flagType": flag_type,
+            "componentKey": component_key,
+            "reason": reason,
+            "manualReviewRequired": True,
+            "deductionType": deduction_type,
+            "configuredDeduction": configured_deduction,
+            "deductionPoints": 0.0,
+            "deductionStatus": "PENDING_CALCULATION",
+            **details,
+        }
+
+    money_in_threshold = float(policy["money_in_flag_threshold_usd"])
+    money_out_threshold = float(policy["money_out_flag_threshold_usd"])
+    valid_history_ids = {id(item) for item in valid_history_transactions}
+    for index, transaction in enumerate(transactions):
+        if not isinstance(transaction, dict) or id(transaction) not in valid_history_ids:
+            continue
+        amount = _number(transaction.get("amount"))
+        currency = _currency(transaction.get("currency") or scoring_currency)
+        rate = _transaction_exchange_rate_to_usd(currency, exchange_rates)
+        direction = transaction.get("direction")
+        if amount is None or rate is None or direction not in {"credit", "debit"}:
+            continue
+        amount_usd = round(abs(amount) * rate, 2)
+        transaction_id = transaction_identifier(index, transaction)
+        if direction == "credit" and amount_usd >= money_in_threshold:
+            add_scoring_flag(
+                "MONEY_IN_THRESHOLD",
+                "transaction_history",
+                transaction_id,
+                f"Money In is at least USD {money_in_threshold:,.2f}.",
+                "POINTS",
+                0,
+                transactionIndex=index,
+                date=transaction.get("date"),
+                amount=abs(amount),
+                currency=currency,
+                amountUsd=amount_usd,
+                direction=direction,
+                thresholdUsd=money_in_threshold,
+                referenceNumber=_transaction_reference(transaction),
+                transactionReference=_transaction_reference(transaction),
+            )
+        elif direction == "debit" and amount_usd >= money_out_threshold:
+            add_scoring_flag(
+                "MONEY_OUT_THRESHOLD",
+                "transaction_history",
+                transaction_id,
+                f"Money Out is at least USD {money_out_threshold:,.2f}.",
+                "POINTS",
+                0,
+                transactionIndex=index,
+                date=transaction.get("date"),
+                amount=abs(amount),
+                currency=currency,
+                amountUsd=amount_usd,
+                direction=direction,
+                thresholdUsd=money_out_threshold,
+                referenceNumber=_transaction_reference(transaction),
+                transactionReference=_transaction_reference(transaction),
+            )
+
+    for index, transaction in enumerate(transactions):
+        if (
+            not isinstance(transaction, dict)
+            or not transaction_in_period(transaction)
+        ):
+            continue
+        balance_evidence = transaction_balance_evidence(transaction)
+        if (
+            balance_evidence is None
+            or balance_evidence["amountUsd"] >= minimum_balance_threshold
+        ):
+            continue
+        transaction_id = transaction_identifier(index, transaction)
+        transaction_amount = _number(transaction.get("amount"))
+        transaction_currency = _currency(
+            transaction.get("currency") or scoring_currency
+        )
+        transaction_rate = _transaction_exchange_rate_to_usd(
+            transaction_currency, exchange_rates
+        )
+        add_scoring_flag(
+            "TRANSACTION_BALANCE_BELOW_MINIMUM",
+            "ending_balance",
+            transaction_id,
+            f"The transaction balance is below USD {minimum_balance_threshold:,.2f}.",
+            "POINTS",
+            0,
+            transactionIndex=index,
+            date=transaction.get("date"),
+            amount=balance_evidence["amount"],
+            currency=balance_evidence["currency"],
+            amountUsd=balance_evidence["amountUsd"],
+            transactionAmount=(
+                abs(transaction_amount) if transaction_amount is not None else None
+            ),
+            transactionAmountUsd=(
+                round(abs(transaction_amount) * transaction_rate, 2)
+                if transaction_amount is not None and transaction_rate is not None
+                else None
+            ),
+            direction=transaction.get("direction"),
+            description=transaction.get("description"),
+            page=transaction.get("page"),
+            thresholdUsd=minimum_balance_threshold,
+            referenceNumber=_transaction_reference(transaction),
+            transactionReference=_transaction_reference(transaction),
+            balanceUsd=balance_evidence["amountUsd"],
+        )
+
+    for check in result.get("monthlyBalanceChecks") or []:
+        if (
+            not isinstance(check, dict)
+            or check.get("minimumBalanceStatus") != "BELOW_MINIMUM"
+            or check.get("currency") != "USD"
+        ):
+            continue
+        month = str(check.get("month") or "")
+        source_transaction = check.get("sourceTransaction")
+        transaction_id = (
+            str(source_transaction)
+            if source_transaction is not None
+            else f"monthly-close:{month}"
+        )
+        add_scoring_flag(
+            "MONTHLY_CLOSING_BALANCE_BELOW_MINIMUM",
+            "ending_balance",
+            transaction_id,
+            f"The {month} monthly closing balance is below USD {required_balance:,.2f}.",
+            "POINTS",
+            0,
+            month=month,
+            amount=check.get("closingBalance"),
+            currency=check.get("currency"),
+            thresholdUsd=required_balance,
+            shortfall=check.get("shortfall"),
+            sourcePage=check.get("sourcePage"),
+            sourceTransaction=source_transaction,
+            sourceDate=check.get("sourceDate"),
+        )
+
+    for index, candidate in sorted(review_candidates.items()):
+        if candidate.get("status") != "UNVERIFIED":
+            continue
+        transaction = transactions[index]
+        add_scoring_flag(
+            "SOURCE_OF_FUNDS_UNCONFIRMED",
+            "transaction_history",
+            transaction_identifier(index, transaction),
+            "The transaction source has not been confirmed.",
+            "POINTS",
+            default_penalty,
+            transactionIndex=index,
+            date=candidate.get("date"),
+            amount=candidate.get("amount"),
+            currency=candidate.get("currency"),
+            direction=candidate.get("direction"),
+            amountUsd=candidate.get("amountUsd"),
+            referenceNumber=candidate.get("reference"),
+            transactionReference=_transaction_reference(transaction),
+            sourceStatus=candidate.get("status"),
+            reviewerId=candidate.get("reviewerId"),
+            reviewedAt=candidate.get("reviewedAt"),
+            reviewNotes=candidate.get("reviewNotes"),
+        )
+
+    scoring_flags = list(scoring_flags_by_key.values())
+
+    unverified_reviews = [
+        item
+        for item in review_candidates.values()
+        if item["status"] == "UNVERIFIED"
+    ]
+    monthly_activity: dict[str, dict[str, Any]] = {}
+    for item in valid_history_transactions:
+        tx_date = transaction_date(item)
+        if tx_date is None:
+            continue
+        month = tx_date.strftime("%Y-%m")
+        activity = monthly_activity.setdefault(
+            month,
+            {"month": month, "totalDeposits": 0.0, "totalWithdrawals": 0.0,
+             "incomingCount": 0, "outgoingCount": 0, "transactionCount": 0},
+        )
+        amount = abs(float(item["amount"]))
+        direction = item["direction"]
+        if direction == "credit":
+            activity["totalDeposits"] += amount
+            activity["incomingCount"] += 1
+        else:
+            activity["totalWithdrawals"] += amount
+            activity["outgoingCount"] += 1
+        activity["transactionCount"] += 1
+    base_monthly_summary = {
+        str(item.get("month")): item
+        for item in (result.get("transactionSummary") or {}).get("monthly", [])
+        if isinstance(item, dict) and item.get("month")
+    }
+    monthly_checks_by_month = {
+        str(item.get("month")): item
+        for item in result.get("monthlyBalanceChecks") or []
+        if isinstance(item, dict) and item.get("month")
+    }
+    monthly_activity_rows = []
+    for month in sorted(evaluated_months | set(monthly_activity)):
+        activity = monthly_activity.get(
+            month,
+            {
+                "totalDeposits": 0.0,
+                "totalWithdrawals": 0.0,
+                "incomingCount": 0,
+                "outgoingCount": 0,
+                "transactionCount": 0,
+            },
+        )
+        base_summary = base_monthly_summary.get(month, {})
+        check = monthly_checks_by_month.get(month, {})
+        closing_balance = (
+            check.get("closingBalance")
+            if check.get("closingBalance") is not None
+            else base_summary.get("closingBalance")
+        )
+        monthly_activity_rows.append(
+            {
+                "month": month,
+                "totalDeposits": round(activity["totalDeposits"], 2),
+                "totalWithdrawals": round(activity["totalWithdrawals"], 2),
+                "incomingCount": activity["incomingCount"],
+                "outgoingCount": activity["outgoingCount"],
+                "transactionCount": activity["transactionCount"],
+                "closingBalance": closing_balance,
+                "currency": check.get("currency")
+                or base_summary.get("currency")
+                or scoring_currency,
+                "minimumRequired": (
+                    check.get("minimumRequired")
+                    if check.get("minimumRequired") is not None
+                    else base_summary.get("minimumRequired")
+                ),
+                "differenceFromMinimum": (
+                    check.get("differenceFromMinimum")
+                    if check.get("differenceFromMinimum") is not None
+                    else base_summary.get("differenceFromMinimum")
+                ),
+                "shortfall": (
+                    check.get("shortfall")
+                    if check.get("shortfall") is not None
+                    else base_summary.get("shortfall")
+                ),
+                "minimumBalanceStatus": check.get("minimumBalanceStatus")
+                or base_summary.get("minimumBalanceStatus")
+                or "INSUFFICIENT_DATA",
+                "closingBalanceEvidenceAvailable": closing_balance is not None,
+                "closingBalanceStatus": check.get("status")
+                or ("AVAILABLE" if closing_balance is not None else "INSUFFICIENT_DATA"),
+                "closingBalanceSource": check.get("source")
+                or base_summary.get("closingBalanceSource"),
+                "sourcePage": check.get("sourcePage")
+                or base_summary.get("sourcePage"),
+                "sourceTransaction": check.get("sourceTransaction")
+                or base_summary.get("sourceTransaction"),
+                "sourceDate": check.get("sourceDate")
+                or base_summary.get("sourceDate"),
+            }
+        )
+    period_money_in = round(
+        sum(
+            abs(float(item["amount"]))
+            for item in valid_history_transactions
+            if item["direction"] == "credit"
+        ),
+        2,
+    )
+    period_money_out = round(
+        sum(
+            abs(float(item["amount"]))
+            for item in valid_history_transactions
+            if item["direction"] == "debit"
+        ),
+        2,
+    )
+    period_recurring_candidates = [
+        candidate
+        for candidate in result.get("sourceOfFundsAnalysis", {}).get(
+            "recurringIncomeCandidates", []
+        )
+        if any(
+            index in period_transaction_indices
+            for index in candidate.get("transactionIndexes", [])
+        )
+    ]
+    result["transactionSummary"] = {
+        **(result.get("transactionSummary") or {}),
+        "totalDeposits": period_money_in,
+        "totalWithdrawals": period_money_out,
+        "incomingCount": sum(row["incomingCount"] for row in monthly_activity_rows),
+        "outgoingCount": sum(row["outgoingCount"] for row in monthly_activity_rows),
+        "monthly": monthly_activity_rows,
+    }
+    history_component = component(
+        "transaction_history",
+        history_ratio,
+        "Based on in-period transaction completeness, money-in/money-out reconciliation, duplicate consistency, and saved source-review outcomes. Threshold flags are informational; only an unverified source deducts points.",
+        {
+            "statementStartDate": start.isoformat() if start else None,
+            "statementEndDate": end.isoformat() if end else None,
+            "monthsEvaluated": sorted(evaluated_months),
+            "validTransactionCount": complete_rows,
+            "transactionCount": total_rows,
+            "duplicateTransactionCount": duplicate_count,
+            "moneyIn": period_money_in,
+            "moneyOut": period_money_out,
+            "reconciliationStatus": reconciliation_status or "INSUFFICIENT_DATA",
+            "sourceEvidenceTransactionCount": sum(
+                bool(
+                    item.get("sourceText")
+                    or item.get("source_text")
+                    or item.get("evidence")
+                    or item.get("sourceEvidence")
+                )
+                for item in period_transactions
+                if isinstance(item, dict)
+            ),
+            "depositCount": sum(item.get("direction") == "credit" for item in valid_history_transactions),
+            "withdrawalCount": sum(item.get("direction") == "debit" for item in valid_history_transactions),
+            "transferCount": sum(
+                any(term in str(item.get("description") or "").casefold() for term in ("transfer", "wire", "remittance"))
+                for item in valid_history_transactions
+            ),
+            "recurringIncomeCandidates": len(period_recurring_candidates),
+            "monthlyActivity": monthly_activity_rows,
+            "sourceReviewCandidateCount": len(review_candidates),
+            "unverifiedSourceCount": len(unverified_reviews),
+        },
+    )
+
+    coverage_days = (end - start).days + 1 if start and end and end >= start else None
+    transaction_dates = [
+        _date(item.get("date")) for item in valid_history_transactions
+    ]
+    dated_in_period = [
+        item for item in transaction_dates
+        if item and (not start or item >= start) and (not end or item <= end)
+    ]
+    covered_months = {
+        item.strftime("%Y-%m") for item in dated_in_period
+    }.intersection(evaluated_months)
+    missing_activity_months = sorted(evaluated_months - covered_months)
+    coverage_ratio = (
+        min(1.0, coverage_days / period_days)
+        if coverage_days is not None and period_days > 0
+        else None
+    )
+    continuity_ratio = (
+        len(covered_months) / len(evaluated_months)
+        if evaluated_months
+        else None
+    )
+    period_ratio = (
+        1.0
+        if dated_in_period and statement_period.get("completeThreeMonths")
+        else None
+    )
+    period_component = component(
+        "transaction_period",
+        period_ratio,
+        "Based on complete three-month statement coverage, supported by dated transactions within the same period.",
+        {
+            "monthsEvaluated": sorted(evaluated_months),
+            "coverageRatio": coverage_ratio,
+            "statementStartDate": start.isoformat() if start else None,
+            "statementEndDate": end.isoformat() if end else None,
+            "coverageDays": coverage_days,
+            "minimumRequiredDays": period_days,
+            "transactionDateCount": len(dated_in_period),
+            "monthsCovered": sorted(covered_months),
+            "monthsMissingTransactionActivity": missing_activity_months,
+            "continuityRatio": continuity_ratio,
+            "completeThreeMonthCoverage": bool(
+                statement_period.get("completeThreeMonths")
+            ),
+            "firstTransactionDate": min(dated_in_period).isoformat() if dated_in_period else None,
+            "lastTransactionDate": max(dated_in_period).isoformat() if dated_in_period else None,
+            "historicalPatternStatus": result["historicalPatternAssessment"]["status"],
+            "historicalPatternAssessment": result["historicalPatternAssessment"],
+        },
+    )
+
+    components = {
+        "ending_balance": ending_component,
+        "starting_balance": starting_component,
+        "transaction_history": history_component,
+        "transaction_period": period_component,
+    }
+    for item in components.values():
+        evidence_points = item.get("points")
+        item["evidenceBasedPoints"] = evidence_points
+        item["basePoints"] = item["maximum"] if item.get("available") else None
+        item["points"] = item["maximum"] if item.get("available") else None
+        item["deductionPoints"] = 0.0
+        item["flagDeductions"] = []
+
+    history_deduction_limit = min(
+        float(policy["maximum_transaction_history_penalty"]),
+        float(weights["transaction_history"]),
+    )
+    history_deduction_total = 0.0
+    for flag in scoring_flags:
+        if flag["flagType"] != "SOURCE_OF_FUNDS_UNCONFIRMED":
+            flag["deductionStatus"] = "INFORMATIONAL_ONLY"
+            continue
+        component_item = components[flag["componentKey"]]
+        if not component_item.get("available") or component_item.get("points") is None:
+            flag["deductionStatus"] = "COMPONENT_UNAVAILABLE"
+            continue
+        maximum = float(component_item["maximum"])
+        configured_deduction = max(0.0, float(flag["configuredDeduction"]))
+        requested_deduction = (
+            maximum * configured_deduction / 100
+            if flag["deductionType"] == "PERCENTAGE"
+            else configured_deduction
+        )
+        remaining_deduction_capacity = float(component_item["points"])
+        if flag["componentKey"] == "transaction_history":
+            remaining_deduction_capacity = min(
+                remaining_deduction_capacity,
+                max(0.0, history_deduction_limit - history_deduction_total),
+            )
+        applied_deduction = round(
+            min(requested_deduction, remaining_deduction_capacity), 2
+        )
+        component_item["points"] = round(
+            max(0.0, float(component_item["points"]) - applied_deduction), 2
+        )
+        component_item["deductionPoints"] = round(
+            float(component_item["deductionPoints"]) + applied_deduction, 2
+        )
+        component_item["flagDeductions"].append(flag)
+        flag["deductionPoints"] = applied_deduction
+        flag["deductionStatus"] = (
+            "APPLIED"
+            if applied_deduction > 0
+            else "CAPPED"
+            if requested_deduction > 0
+            else "NO_DEDUCTION_CONFIGURED"
+        )
+        if flag["componentKey"] == "transaction_history":
+            history_deduction_total = round(
+                history_deduction_total + applied_deduction, 2
+            )
+
+    transaction_flag_types = {
+        "MONEY_IN_THRESHOLD",
+        "MONEY_OUT_THRESHOLD",
+        "TRANSACTION_BALANCE_BELOW_MINIMUM",
+    }
+    for index, candidate in review_candidates.items():
+        candidate_flags = [
+            flag for flag in scoring_flags if flag.get("transactionIndex") == index
+        ]
+        candidate["transactionFlags"] = [
+            flag
+            for flag in candidate_flags
+            if flag["flagType"] in transaction_flag_types
+        ]
+        source_deduction = next(
+            (
+                flag
+                for flag in candidate_flags
+                if flag["flagType"] == "SOURCE_OF_FUNDS_UNCONFIRMED"
+            ),
+            None,
+        )
+        candidate["sourceDeduction"] = (
+            {
+                "points": source_deduction["deductionPoints"],
+                "status": source_deduction["deductionStatus"],
+            }
+            if source_deduction
+            else {
+                "points": 0.0,
+                "status": (
+                    "SOURCE_CONFIRMED"
+                    if candidate["status"] == "CONFIRMED"
+                    else "PENDING_REVIEW"
+                    if candidate["status"] == "PENDING_REVIEW"
+                    else "NO_DEDUCTION"
+                ),
+            }
+        )
+        candidate["penaltyPoints"] = candidate["sourceDeduction"]["points"]
+        candidate["appliedDeductions"] = [
+            {
+                "flagType": flag["flagType"],
+                "componentKey": flag["componentKey"],
+                "points": flag["deductionPoints"],
+                "status": flag["deductionStatus"],
+            }
+            for flag in candidate_flags
+            if flag["deductionPoints"] > 0
+        ]
+
+    history_component["evidence"]["penaltyPoints"] = history_deduction_total
+    history_component["evidence"]["flags"] = [
+        flag
+        for flag in scoring_flags
+        if flag["componentKey"] == "transaction_history"
+    ]
+    history_component["evidence"]["deductions"] = [
+        flag
+        for flag in scoring_flags
+        if flag["componentKey"] == "transaction_history"
+        and flag["deductionPoints"] > 0
+    ]
+    score_result = calculate_bank_statement_score(
+        components,
+        weights=weights,
+        ocr_complete=ocr_complete,
+    )
+    components = score_result["components"]
+    def unique_review_key(item: dict[str, Any]) -> str:
+        return str(
+            item.get("transactionIdentity")
+            or item.get("transactionReference")
+            or f"transaction-index:{item.get('transactionIndex')}"
+        )
+    pending_count = len({
+        unique_review_key(item)
+        for item in review_candidates.values()
+        if item["status"] == "PENDING_REVIEW"
+    })
+    unverified_transaction_count = sum(
+        1
+        for flag in scoring_flags
+        if flag["flagType"] == "SOURCE_OF_FUNDS_UNCONFIRMED"
+        and flag.get("sourceStatus") == "UNVERIFIED"
+    )
+    confirmed_transaction_count = len({
+        unique_review_key(item)
+        for item in review_candidates.values()
+        if item["status"] == "CONFIRMED"
+    })
+    total_penalty_points = round(
+        unverified_transaction_count * SOURCE_UNVERIFIED_PENALTY_POINTS,
+        2,
+    )
+    result["bankStatementScore"] = {
+        **score_result,
+        "statementPeriod": statement_period,
+        "assessment": "COMPUTED" if score_result["available"] else "INSUFFICIENT_DATA",
+        "components": components,
+        "confirmedPoints": None,
+        "confirmedStatus": "NOT_YET_CONFIRMED",
+        "pendingTransactionReviews": pending_count,
+        "unverifiedTransactionCount": unverified_transaction_count,
+        "confirmedTransactionCount": confirmed_transaction_count,
+        "totalPenaltyPoints": total_penalty_points,
+        "sourceReviewDeductionAudit": {
+            "unverifiedTransactionCount": unverified_transaction_count,
+            "confirmedTransactionCount": confirmed_transaction_count,
+            "pendingTransactionCount": pending_count,
+            "deductionPerTransaction": SOURCE_UNVERIFIED_PENALTY_POINTS,
+            "totalDeductionPoints": total_penalty_points,
+            "transactionHistoryBasePoints": components["transaction_history"].get("basePoints"),
+            "transactionHistoryDeductedPoints": total_penalty_points,
+            "transactionHistoryCurrentPoints": components["transaction_history"].get("points"),
+        },
+        "deductions": [
+            flag for flag in scoring_flags if flag["deductionPoints"] > 0
+        ],
+        "triggeredFlags": scoring_flags,
+        "transactionReviews": list(review_candidates.values()),
+        "transactionReviewRequirements": {
+            "sourceEvidenceRequiredForConfirmation": bool(
+                policy["require_source_evidence_for_confirmation"]
+            ),
+            "minimumNotesLength": int(policy["minimum_source_review_notes_length"]),
+            "staffReviewThresholdUsd": threshold_usd,
+            "moneyInFlagThresholdUsd": money_in_threshold,
+            "moneyOutFlagThresholdUsd": money_out_threshold,
+            "minimumMonthlyClosingBalanceUsd": minimum_balance_threshold,
+            "exchangeRatesToUsd": exchange_rates,
+            "unverifiedSourcePenaltyPoints": default_penalty,
+            "deductPendingSourceReview": False,
+            "moneyInFlagDeductionPercent": 0.0,
+            "moneyOutFlagDeductionPercent": 0.0,
+            "monthlyLowBalanceFlagDeductionPercent": 0.0,
+            "maximumTransactionHistoryPenalty": float(
+                policy["maximum_transaction_history_penalty"]
+            ),
+            "maximumBankScore": score_result["maximum"],
+        },
+        "formula": (
+            "Ending Balance 22.50 + Starting Balance 6.75 + "
+            "Transaction History 9.00 + Transaction Period 6.75 = 45; "
+            "only a completed unverified-source review deducts 0.50 points."
+        ),
+    }
+    manual_review_required = bool(scoring_flags) or any(
+        flag.get("manualReviewRequired") for flag in result.get("riskFlags") or []
+    )
+    result["bankStatementScore"]["manualReviewRequired"] = manual_review_required
+    result["bankStatementScore"]["manualReviewStatus"] = (
+        "NEEDS_MANUAL_REVIEW" if manual_review_required else "NOT_REQUIRED"
+    )
+    result["scoringFlags"] = scoring_flags
+    result["manualReviewRequired"] = manual_review_required
+    result["manualReviewStatus"] = (
+        "NEEDS_MANUAL_REVIEW" if manual_review_required else "NOT_REQUIRED"
+    )
+    result["transactionSourceReviews"] = list(review_candidates.values())
+    result["bankStatementScore"]["evidenceCoveragePercentage"] = round(
+        score_result["availableMaximumPoints"] / score_result["maximum"] * 100,
+        2,
+    ) if score_result["maximum"] else 0.0
+    if not ocr_complete:
+        for item in components.values():
+            item["points"] = None
+            item["available"] = False
+            item["evidence_ratio"] = None
+        result["bankStatementScore"]["points"] = None
+        result["bankStatementScore"]["percentage"] = None
+        result["bankStatementScore"]["confirmedPoints"] = None
+        result["bankStatementScore"]["available"] = False
+        result["bankStatementScore"]["assessment"] = "INSUFFICIENT_DATA"
+    return result
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -150,8 +1602,16 @@ def _currency(value: Any) -> str:
     return normalized
 
 
-def _normalized_name(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+def _transaction_exchange_rate_to_usd(
+    currency: str, exchange_rates: dict[str, Any]
+) -> float | None:
+    if currency == "USD":
+        return 1.0
+    rate = exchange_rates.get(currency)
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        return None
+    normalized_rate = float(rate)
+    return normalized_rate if math.isfinite(normalized_rate) and normalized_rate > 0 else None
 
 
 def _direction(transaction: dict[str, Any]) -> str | None:
@@ -185,7 +1645,7 @@ def _page_duplicates(raw_text: str) -> list[dict[str, Any]]:
     return duplicates
 
 
-def analyze_bank_statement(
+def _analyze_bank_statement_base(
     fields: dict[str, Any],
     *,
     raw_text: str = "",
@@ -196,11 +1656,9 @@ def analyze_bank_statement(
 ) -> dict[str, Any]:
     """Analyze extracted evidence without asserting that the statement is authentic."""
     policy = config or DEFAULT_BANK_STATEMENT_SCORING
-    weights = policy.get("weights", DEFAULT_BANK_STATEMENT_SCORING["weights"])
     threshold = float(
         policy.get("minimum_monthly_closing_balance_usd", 4000)
     )
-    full_balance_score = float(policy.get("full_balance_score_usd", 8000))
     recent_deposit_days = int(policy.get("recent_large_deposit_days", 30))
     rapid_days = int(policy.get("rapid_funds_outflow_days", 7))
     rapid_ratio = float(policy.get("rapid_funds_outflow_ratio", 0.8))
@@ -253,32 +1711,133 @@ def analyze_bank_statement(
         )
 
     evidence_by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    monthly_balances = fields.get("monthlyClosingBalances") or fields.get("monthly_closing_balances")
-    if isinstance(monthly_balances, list):
+    opening_evidence_by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    monthly_balance_sources = (
+        (
+            fields.get("monthlyClosingBalances")
+            or fields.get("monthly_closing_balances"),
+            "extracted_monthly_closing_balance",
+        ),
+        (
+            fields.get("monthlyBalanceHistory")
+            or fields.get("monthly_balance_history")
+            or fields.get("bankMonthlySummaries"),
+            "extracted_monthly_balance_history",
+        ),
+    )
+    for monthly_balances, source in monthly_balance_sources:
+        if not isinstance(monthly_balances, list):
+            continue
         for item in monthly_balances:
             if not isinstance(item, dict):
                 continue
-            key = _month_key(item.get("month") or item.get("date") or item.get("monthEndDate"))
+            key = _month_key(
+                item.get("month")
+                or item.get("date")
+                or item.get("monthEndDate")
+                or item.get("month_end_date")
+            )
+            opening_amount = _number(
+                item.get("openingBalance")
+                if item.get("openingBalance") is not None
+                else item.get("opening_balance")
+            )
+            if key and opening_amount is not None:
+                opening_evidence_by_month[key].append(
+                    {
+                        "amount": opening_amount,
+                        "currency": _currency(
+                            item.get("currency")
+                            or item.get("currencyCode")
+                            or item.get("currency_code")
+                            or statement_currency
+                        ),
+                        "page": item.get("openingPage")
+                        or item.get("opening_page"),
+                        "sourceText": str(
+                            item.get("openingSourceText")
+                            or item.get("opening_source_text")
+                            or ""
+                        )[:500],
+                        "source": "extracted_monthly_opening_balance",
+                    }
+                )
             amount = _number(
                 item.get("closingBalance")
                 if item.get("closingBalance") is not None
+                else item.get("closing_balance")
+                if item.get("closing_balance") is not None
                 else item.get("balance")
+                if item.get("balance") is not None
+                else item.get("endingBalance")
+                if item.get("endingBalance") is not None
+                else item.get("ending_balance")
             )
             if key and amount is not None:
                 evidence_by_month[key].append(
                     {
                         "amount": amount,
-                        "currency": _currency(item.get("currency") or statement_currency),
-                        "date": item.get("date") or item.get("monthEndDate"),
-                        "page": item.get("closingPage") or item.get("page"),
+                        "currency": _currency(
+                            item.get("currency")
+                            or item.get("currencyCode")
+                            or item.get("currency_code")
+                            or statement_currency
+                        ),
+                        "date": item.get("date")
+                        or item.get("monthEndDate")
+                        or item.get("month_end_date"),
+                        "page": item.get("closingPage")
+                        or item.get("closing_page")
+                        or item.get("sourcePage")
+                        or item.get("source_page")
+                        or item.get("page"),
+                        "transaction": item.get("closingRow")
+                        or item.get("closing_row")
+                        or item.get("sourceTransaction")
+                        or item.get("source_transaction")
+                        or item.get("row")
+                        or item.get("rowNumber")
+                        or item.get("row_number"),
                         "sourceText": str(
                             item.get("closingSourceText")
+                            or item.get("closing_source_text")
                             or item.get("sourceText")
+                            or item.get("source_text")
                             or ""
                         )[:500],
-                        "source": "extracted_monthly_closing_balance",
+                        "source": source,
                     }
                 )
+
+    transaction_month_end_evidence: dict[str, dict[str, Any]] = {}
+    for transaction in transactions:
+        tx_date = _date(transaction.get("date"))
+        balance = transaction.get("running_balance")
+        if (
+            transaction.get("extraction_status") != "VALID"
+            or tx_date is None
+            or balance is None
+            or tx_date.day != calendar.monthrange(tx_date.year, tx_date.month)[1]
+        ):
+            continue
+        key = tx_date.strftime("%Y-%m")
+        transaction_month_end_evidence[key] = {
+            "amount": float(balance),
+            "currency": _currency(transaction.get("currency") or statement_currency),
+            "date": tx_date.isoformat(),
+            "page": transaction.get("page"),
+            "transaction": transaction.get("sourceRowId")
+            or transaction.get("rowNumber")
+            or transaction.get("row_number")
+            or transaction.get("row"),
+            "sourceText": str(
+                transaction.get("sourceText") or transaction.get("evidence") or ""
+            )[:500],
+            "source": "transaction_running_balance",
+        }
+    for month, evidence in transaction_month_end_evidence.items():
+        # The last source-order balance on month-end is the monthly close.
+        evidence_by_month[month].append(evidence)
 
     if not statement_currency:
         explicit_currencies = {
@@ -289,68 +1848,178 @@ def analyze_bank_statement(
         }
         if len(explicit_currencies) == 1:
             statement_currency = explicit_currencies.pop()
+    if statement_currency:
+        for candidates in evidence_by_month.values():
+            for candidate in candidates:
+                if not candidate["currency"]:
+                    candidate["currency"] = statement_currency
+        for candidates in opening_evidence_by_month.values():
+            for candidate in candidates:
+                if not candidate["currency"]:
+                    candidate["currency"] = statement_currency
 
-    monthly_balance_history = fields.get("monthlyBalanceHistory") or fields.get("monthly_balance_history")
-    if not isinstance(monthly_balance_history, list):
-        monthly_balance_history = (
-            monthly_balances if isinstance(monthly_balances, list) else []
-        )
-    serialized_monthly_balance_history = []
-    for item in monthly_balance_history:
-        if not isinstance(item, dict):
-            continue
-        key = _month_key(item.get("month") or item.get("date"))
-        if not key:
-            continue
-        serialized_monthly_balance_history.append(
+    statement_closing_balance = _number(fields.get("closingBalance"))
+    if period_end and statement_closing_balance is not None:
+        evidence_by_month[period_end.strftime("%Y-%m")].append(
             {
-                "month": key,
-                "openingBalance": _number(item.get("openingBalance")),
-                "closingBalance": _number(item.get("closingBalance")),
-                "currency": _currency(item.get("currency") or statement_currency)
-                or None,
-                "openingPage": item.get("openingPage"),
-                "closingPage": item.get("closingPage") or item.get("page"),
-                "openingSourceText": str(item.get("openingSourceText") or "")[:500],
-                "closingSourceText": str(
-                    item.get("closingSourceText") or item.get("sourceText") or ""
-                )[:500],
+                "amount": statement_closing_balance,
+                "currency": statement_currency,
+                "date": period_end.isoformat(),
+                "page": fields.get("closingBalancePage"),
+                "sourceText": str(fields.get("closingBalanceSourceText") or "")[:500],
+                "source": "extracted_statement_closing_balance",
             }
         )
 
-    for transaction in transactions:
-        if not isinstance(transaction, dict):
+    serialized_history_by_month: dict[str, dict[str, Any]] = {}
+    for monthly_balances, _ in monthly_balance_sources:
+        if not isinstance(monthly_balances, list):
             continue
-        transaction_date = _date(
-            transaction.get("date")
-            or transaction.get("transactionDate")
-            or transaction.get("transaction_date")
+        for item in monthly_balances:
+            if not isinstance(item, dict):
+                continue
+            key = _month_key(
+                item.get("month")
+                or item.get("date")
+                or item.get("monthEndDate")
+                or item.get("month_end_date")
+            )
+            if not key:
+                continue
+            previous = serialized_history_by_month.get(key, {})
+            opening_balance = _number(
+                item.get("openingBalance")
+                if item.get("openingBalance") is not None
+                else item.get("opening_balance")
+            )
+            closing_balance = _number(
+                item.get("closingBalance")
+                if item.get("closingBalance") is not None
+                else item.get("closing_balance")
+                if item.get("closing_balance") is not None
+                else item.get("balance")
+                if item.get("balance") is not None
+                else item.get("endingBalance")
+                if item.get("endingBalance") is not None
+                else item.get("ending_balance")
+            )
+            serialized_history_by_month[key] = {
+                **previous,
+                "month": key,
+                "openingBalance": (
+                    opening_balance
+                    if opening_balance is not None
+                    else previous.get("openingBalance")
+                ),
+                "closingBalance": (
+                    closing_balance
+                    if closing_balance is not None
+                    else previous.get("closingBalance")
+                ),
+                "currency": _currency(
+                    item.get("currency")
+                    or item.get("currencyCode")
+                    or item.get("currency_code")
+                    or previous.get("currency")
+                    or statement_currency
+                )
+                or None,
+                "openingPage": item.get("openingPage")
+                or item.get("opening_page")
+                or previous.get("openingPage"),
+                "closingPage": item.get("closingPage")
+                or item.get("closing_page")
+                or item.get("sourcePage")
+                or item.get("source_page")
+                or item.get("page")
+                or previous.get("closingPage"),
+                "openingSourceText": str(
+                    item.get("openingSourceText")
+                    or item.get("opening_source_text")
+                    or previous.get("openingSourceText")
+                    or ""
+                )[:500],
+                "closingSourceText": str(
+                    item.get("closingSourceText")
+                    or item.get("closing_source_text")
+                    or item.get("sourceText")
+                    or item.get("source_text")
+                    or previous.get("closingSourceText")
+                    or ""
+                )[:500],
+            }
+    serialized_monthly_balance_history = [
+        serialized_history_by_month[key]
+        for key in sorted(serialized_history_by_month)
+    ]
+
+    period_opening_candidates = (
+        list(opening_evidence_by_month.get(month_keys[0], []))
+        if month_keys
+        else []
+    )
+    if month_keys:
+        first_month_year, first_month_number = (
+            int(part) for part in month_keys[0].split("-")
         )
-        balance = _number(
-            transaction.get("balance")
-            if transaction.get("balance") is not None
-            else transaction.get("running_balance")
-            if transaction.get("running_balance") is not None
-            else transaction.get("runningBalance")
+        previous_year, previous_month = _shift_month(
+            first_month_year, first_month_number, -1
         )
-        if not transaction_date or balance is None:
-            continue
-        month_last_day = calendar.monthrange(
-            transaction_date.year, transaction_date.month
-        )[1]
-        if transaction_date.day == month_last_day:
-            evidence_by_month.setdefault(
-                transaction_date.strftime("%Y-%m"), []
-            ).append(
+        previous_month_key = f"{previous_year:04d}-{previous_month:02d}"
+        previous_closings = evidence_by_month.get(previous_month_key, [])
+        previous_amounts = {
+            round(item["amount"], 2) for item in previous_closings
+        }
+        previous_currencies = {
+            item["currency"]
+            for item in previous_closings
+            if item.get("currency")
+        }
+        if (
+            len(previous_amounts) == 1
+            and len(previous_currencies) <= 1
+            and not any(
+                item.get("ambiguous") for item in previous_closings
+            )
+        ):
+            previous_close = next(iter(previous_closings))
+            period_opening_candidates.append(
                 {
-                    "amount": balance,
-                    "currency": statement_currency,
-                    "date": transaction_date.isoformat(),
-                    "page": transaction.get("page"),
-                    "sourceText": str(transaction.get("evidence") or transaction.get("source_text") or "")[:500],
-                    "source": "month_end_transaction_balance",
+                    "amount": previous_close["amount"],
+                    "currency": previous_close["currency"],
+                    "page": previous_close.get("page"),
+                    "sourceText": previous_close.get("sourceText") or "",
+                    "source": "previous_month_closing_balance",
+                    "date": previous_close.get("date"),
                 }
             )
+    if period_start and month_keys:
+        scoring_start = date.fromisoformat(f"{month_keys[0]}-01")
+        statement_opening = _number(fields.get("openingBalance"))
+        if period_start == scoring_start and statement_opening is not None:
+            period_opening_candidates.append(
+                {
+                    "amount": statement_opening,
+                    "currency": statement_currency,
+                    "page": fields.get("openingBalancePage"),
+                    "sourceText": str(fields.get("openingBalanceSourceText") or "")[:500],
+                    "source": "extracted_statement_opening_balance",
+                }
+            )
+    opening_amounts = {
+        round(item["amount"], 2) for item in period_opening_candidates
+    }
+    opening_currencies = {
+        item["currency"] for item in period_opening_candidates if item["currency"]
+    }
+    period_opening_ambiguous = (
+        len(opening_amounts) > 1 or len(opening_currencies) > 1
+    )
+    period_opening_balance = (
+        next(iter(opening_amounts))
+        if len(opening_amounts) == 1 and not period_opening_ambiguous
+        else None
+    )
 
     monthly_checks = []
     if month_keys:
@@ -360,16 +2029,50 @@ def analyze_bank_statement(
                 round(item["amount"], 2)
                 for item in candidates
             }
-            item = candidates[-1] if candidates else None
+            unique_currencies = {item["currency"] for item in candidates}
+            ambiguous = len(unique_amounts) > 1 or len(unique_currencies) > 1
+            item = (
+                max(
+                    candidates,
+                    key=lambda candidate: (
+                        bool(candidate.get("page")),
+                        bool(candidate.get("transaction")),
+                        bool(candidate.get("sourceText")),
+                        bool(candidate.get("date")),
+                    ),
+                )
+                if candidates and not ambiguous
+                else None
+            )
             closing_balance = item["amount"] if item else None
             currency = item["currency"] if item else statement_currency
-            ambiguous = len(unique_amounts) > 1
-            if not period_complete or closing_balance is None or currency != "USD" or ambiguous:
-                status = "INSUFFICIENT_DATA"
-            elif closing_balance < threshold:
-                status = "FAIL"
-            else:
-                status = "PASS"
+            status = (
+                "CONFLICTING_DATA"
+                if ambiguous
+                else "AVAILABLE"
+                if closing_balance is not None
+                else "INSUFFICIENT_DATA"
+            )
+            minimum_balance_status = "INSUFFICIENT_DATA"
+            minimum_required = None
+            difference_from_minimum = None
+            shortfall = None
+            if not ambiguous and closing_balance is not None:
+                if currency == "USD":
+                    minimum_required = threshold
+                    difference_from_minimum = round(
+                        closing_balance - threshold, 2
+                    )
+                    shortfall = round(
+                        max(0.0, threshold - closing_balance), 2
+                    )
+                    minimum_balance_status = (
+                        "BELOW_MINIMUM"
+                        if closing_balance < threshold
+                        else "MEETS_MINIMUM"
+                    )
+                else:
+                    minimum_balance_status = "NOT_ASSESSED"
             monthly_checks.append(
                 {
                     "month": key,
@@ -377,34 +2080,67 @@ def analyze_bank_statement(
                     if closing_balance is not None
                     else None,
                     "currency": currency or None,
-                    "minimumRequired": threshold if currency == "USD" else None,
-                    "differenceFromMinimum": round(closing_balance - threshold, 2)
-                    if closing_balance is not None and currency == "USD"
-                    else None,
+                    "minimumRequired": minimum_required,
+                    "differenceFromMinimum": difference_from_minimum,
+                    "shortfall": shortfall,
+                    "minimumBalanceStatus": minimum_balance_status,
                     "status": status,
+                    "evidencePurpose": "SUPPORTING_INFORMATION",
                     "source": item["source"] if item else None,
                     "sourcePage": item["page"] if item else None,
+                    "sourceTransaction": item.get("transaction") if item else None,
+                    "sourceDate": item.get("date") if item else None,
                     "sourceText": item["sourceText"] if item else "",
                     "ambiguous": ambiguous,
                 }
             )
 
-    month_statuses = [item["status"] for item in monthly_checks]
-    if any(status == "FAIL" for status in month_statuses):
-        financial_requirement_status = "FAIL"
-    elif len(monthly_checks) != 3 or any(
-        status != "PASS" for status in month_statuses
+    latest_month_check = next(
+        (
+            item
+            for item in reversed(monthly_checks)
+            if period_end and item["month"] == period_end.strftime("%Y-%m")
+        ),
+        None,
+    )
+    if (
+        not period_complete
+        or latest_month_check is None
+        or latest_month_check.get("ambiguous")
+        or latest_month_check.get("closingBalance") is None
+        or latest_month_check.get("currency") != "USD"
     ):
         financial_requirement_status = "INSUFFICIENT_DATA"
     else:
-        financial_requirement_status = "PASS"
-    available_closings = [
-        item["closingBalance"]
-        for item in monthly_checks
-        if item["closingBalance"] is not None
-        and item["currency"] == "USD"
-    ]
-
+        latest_balance = float(latest_month_check["closingBalance"])
+        financial_requirement_status = (
+            "BELOW_MINIMUM" if latest_balance < threshold else "PASS"
+        )
+    minimum_balance_assessment = {
+        "status": financial_requirement_status,
+        "balance": (
+            round(float(latest_month_check["closingBalance"]), 2)
+            if latest_month_check
+            and latest_month_check.get("closingBalance") is not None
+            else None
+        ),
+        "currency": latest_month_check.get("currency") if latest_month_check else None,
+        "minimum": threshold,
+        "shortfall": (
+            round(
+                max(
+                    0.0,
+                    threshold - float(latest_month_check["closingBalance"]),
+                ),
+                2,
+            )
+            if financial_requirement_status == "BELOW_MINIMUM"
+            and latest_month_check
+            else 0.0
+            if financial_requirement_status == "PASS"
+            else None
+        ),
+    }
     flags: list[dict[str, Any]] = []
 
     def add_flag(
@@ -430,6 +2166,10 @@ def analyze_bank_statement(
                     "currency": statement_currency or None,
                     "description": str(transaction.get("description") or "")[:160],
                     "page": transaction.get("page"),
+                    "transactionIndex": transaction.get("transactionIndex"),
+                    "referenceNumber": transaction.get("referenceNumber"),
+                    "sender": transaction.get("sender"),
+                    "receiver": transaction.get("receiver"),
                 }
             )
         flag.update(details)
@@ -446,54 +2186,75 @@ def analyze_bank_statement(
             "USD balance thresholds cannot be applied without a verified exchange rate.",
         )
     for item in monthly_checks:
-        if item["status"] == "FAIL":
-            add_flag(
-                "MONTHLY_BALANCE_BELOW_REQUIRED",
-                f"{item['month']} closing balance is below the configured USD minimum.",
-                month=item["month"],
-                closingBalance=item["closingBalance"],
-                minimumRequired=item["minimumRequired"],
-            )
-        elif item["ambiguous"]:
+        if item["ambiguous"]:
             add_flag(
                 "CONFLICTING_MONTHLY_BALANCES",
                 f"More than one closing balance was extracted for {item['month']}.",
                 month=item["month"],
             )
+    for month, candidates in opening_evidence_by_month.items():
+        amounts = {round(item["amount"], 2) for item in candidates}
+        currencies = {
+            item["currency"] for item in candidates if item.get("currency")
+        }
+        if len(amounts) > 1 or len(currencies) > 1:
+            add_flag(
+                "CONFLICTING_MONTHLY_OPENING_BALANCES",
+                f"More than one opening balance was extracted for {month}.",
+                month=month,
+            )
+    if period_opening_ambiguous:
+        add_flag(
+            "CONFLICTING_PERIOD_OPENING_BALANCES",
+            "Conflicting opening balances were extracted for the beginning of the complete three-month period.",
+            month=month_keys[0] if month_keys else None,
+        )
+    monthly_history_by_month = {
+        item["month"]: item for item in serialized_monthly_balance_history
+    }
+    reconciliation_tolerance = float(
+        (financial_config or {}).get("targets", {}).get(
+            "reconciliation_tolerance", 1
+        )
+    )
+    for previous_month, next_month in zip(month_keys, month_keys[1:]):
+        previous_close = monthly_history_by_month.get(previous_month, {}).get(
+            "closingBalance"
+        )
+        next_open = monthly_history_by_month.get(next_month, {}).get(
+            "openingBalance"
+        )
+        if (
+            previous_close is not None
+            and next_open is not None
+            and abs(previous_close - next_open) > reconciliation_tolerance
+        ):
+            add_flag(
+                "MONTHLY_BALANCE_CONTINUITY_MISMATCH",
+                f"The {next_month} opening balance does not reconcile with the {previous_month} closing balance.",
+                month=next_month,
+                previousMonth=previous_month,
+                previousClosingBalance=previous_close,
+                openingBalance=next_open,
+                tolerance=reconciliation_tolerance,
+            )
+    if financial_requirement_status == "BELOW_MINIMUM" and latest_month_check:
+        add_flag(
+            "PERIOD_END_BALANCE_BELOW_REQUIRED",
+            "The closing balance at the end of the complete three-month period is below the configured USD minimum.",
+            severity="low",
+            closingBalance=latest_month_check["closingBalance"],
+            minimumRequired=threshold,
+            shortfall=minimum_balance_assessment["shortfall"],
+        )
 
     holder_name = str(fields.get("accountHolderName") or fields.get("account_holder_name") or "")
-    holder_tokens = name_tokens(holder_name)
-    applicant_tokens = name_tokens(applicant_name)
-    name_reason = ""
-    if holder_tokens and applicant_tokens:
-        if holder_tokens == applicant_tokens:
-            name_status = "MATCHED"
-            name_reason = "Name tokens match after case, spacing, punctuation, and ordering normalization."
-        else:
-            overlap = holder_tokens & applicant_tokens
-            shorter = min(len(holder_tokens), len(applicant_tokens))
-            if len(overlap) >= 2 and len(overlap) == shorter:
-                name_status = "POSSIBLE_MATCH"
-                name_reason = "All tokens in the shorter name are present; middle-name or ordering differences require review."
-            elif len(overlap) >= 2 and len(overlap) / max(len(holder_tokens), len(applicant_tokens)) >= 0.5:
-                name_status = "POSSIBLE_MATCH"
-                name_reason = "Several name tokens overlap, but the names are not identical; manual confirmation is required."
-            else:
-                name_status = "NEEDS_MANUAL_REVIEW"
-                name_reason = "The extracted and applicant names differ; this is not a fraud determination."
-        if name_status != "MATCHED":
-            add_flag(
-                "ACCOUNT_HOLDER_NAME_MISMATCH",
-                name_reason,
-            )
-    else:
-        name_status = "INSUFFICIENT_DATA"
-        name_reason = "Account-holder or applicant name evidence is unavailable for comparison."
-        add_flag(
-            "ACCOUNT_HOLDER_NAME_UNAVAILABLE",
-            name_reason,
-            "low",
-        )
+    name_status = "NOT_ASSESSED"
+    name_reason = (
+        "The extracted account-holder name is retained as bank evidence and is not "
+        "compared with the applicant name for financial eligibility. Legal ownership "
+        "of the account is not asserted."
+    )
 
     duplicate_pages = _page_duplicates(raw_text)
     for duplicate in duplicate_pages:
@@ -524,7 +2285,6 @@ def analyze_bank_statement(
             "outgoingCount": 0,
         }
     )
-    complete_transaction_count = 0
     source_terms = (
         "salary", "payroll", "wage", "pension", "business income", "invoice",
         "monthly income", "income", "dividend", "rental income",
@@ -538,6 +2298,18 @@ def analyze_bank_statement(
         direction = _direction(transaction)
         description = str(transaction.get("description") or "")
         month = tx_date.strftime("%Y-%m") if tx_date else None
+        transaction_currency = _currency(transaction.get("currency"))
+        if (
+            transaction_currency
+            and statement_currency
+            and transaction_currency != statement_currency
+        ):
+            add_flag(
+                "TRANSACTION_CURRENCY_MISMATCH",
+                "Transaction currency differs from the statement currency; no conversion was inferred.",
+                "medium",
+                transaction,
+            )
         if tx_date and start_date and end_date and not start_date <= tx_date <= end_date:
             add_flag(
                 "TRANSACTION_OUTSIDE_STATEMENT_PERIOD",
@@ -546,7 +2318,6 @@ def analyze_bank_statement(
                 transaction,
             )
         if tx_date and amount is not None and direction:
-            complete_transaction_count += 1
             summary = monthly_summaries[month]
             key = "deposits" if direction == "credit" else "withdrawals"
             count_key = "incomingCount" if direction == "credit" else "outgoingCount"
@@ -566,7 +2337,7 @@ def analyze_bank_statement(
                             "amount": round(abs(amount), 2),
                             "description": description,
                             "evidence": transaction.get("evidence") or "",
-                            "note": "Description suggests an own-account transfer; confirm account ownership.",
+                            "note": "Description suggests an own-account transfer; verify its source evidence.",
                         }
                     )
                 else:
@@ -678,6 +2449,45 @@ def analyze_bank_statement(
                 transaction,
             )
 
+        if (
+            amount is not None
+            and direction in {"credit", "debit"}
+            and any(term in description for term in transfer_terms)
+            and not any(
+                transaction.get(key)
+                for key in ("sender", "receiver", "counterparty")
+            )
+        ):
+            add_flag(
+                "MISSING_COUNTERPARTY",
+                "Transfer has no extracted sender or receiver information; staff source review may be needed.",
+                "low",
+                transaction,
+            )
+
+    unexplained_credits_by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for tx_date, amount, direction, transaction in parsed_transactions:
+        description = str(transaction.get("description") or "").casefold()
+        if (
+            tx_date
+            and direction == "credit"
+            and amount is not None
+            and not any(term in description for term in source_terms)
+        ):
+            unexplained_credits_by_month[tx_date.strftime("%Y-%m")].append(transaction)
+    for month, deposits_in_month in unexplained_credits_by_month.items():
+        if len(deposits_in_month) < 3:
+            continue
+        for transaction in deposits_in_month:
+            add_flag(
+                "FREQUENT_UNEXPLAINED_DEPOSITS",
+                f"Multiple deposits in {month} lack an identifiable source description; request context without presuming wrongdoing.",
+                "medium",
+                transaction,
+                month=month,
+                monthlyUnexplainedDepositCount=len(deposits_in_month),
+            )
+
     transfer_debits = sorted(
         [
             (tx_date, amount, transaction)
@@ -761,141 +2571,8 @@ def analyze_bank_statement(
             "low",
         )
 
-    score_components: dict[str, dict[str, Any]] = {}
-
-    def add_component(name: str, ratio: float | None, explanation: str) -> None:
-        maximum = float(weights.get(name, 0))
-        points = max(0.0, min(maximum, maximum * ratio)) if ratio is not None else None
-        score_components[name] = {
-            "points": round(points, 2) if points is not None else None,
-            "maximum": maximum,
-            "available": ratio is not None,
-            "explanation": explanation,
-            "evidence_ratio": round(ratio, 4) if ratio is not None else None,
-        }
-
-    balance_ratio = (
-        min(1.0, max(0.0, min(available_closings) / full_balance_score))
-        if len(monthly_checks) == 3
-        and len(available_closings) == 3
-        and period_complete
-        and statement_currency == "USD"
-        and full_balance_score > 0
-        else None
-    )
-    add_component(
-        "three_month_balance_stability",
-        balance_ratio,
-        "Based on the lowest of the three separately checked monthly closing balances; a high month cannot offset a below-minimum month.",
-    )
-    transaction_ratio = (
-        complete_transaction_count / len(transaction_records)
-        if transaction_records and complete_transaction_count
-        else None
-    )
-    if transaction_ratio is not None:
-        if reconciliation_internal["status"] == "mismatch":
-            transaction_ratio *= 0.5
-        if duplicate_transactions:
-            transaction_ratio *= max(
-                0.0,
-                1.0 - len(duplicate_transactions) / len(transaction_records),
-            )
-    add_component(
-        "transaction_history_quality",
-        transaction_ratio,
-        "Based on dated transactions with known amounts and directions, adjusted for duplicates and reconciliation.",
-    )
-    recurring_sources = [
-        item for item in source_patterns.values() if len(item["months"]) >= 2
-    ]
-    source_ratio = 1.0 if recurring_sources else None
-    add_component(
-        "source_of_funds_consistency",
-        source_ratio,
-        "Uses explicit recurring income descriptions only; unclassified deposits require human context.",
-    )
     completeness = calculate_document_verification_score(fields)
-    completeness_ratio = (
-        completeness["document_verification_score"] / 100
-        if completeness["extracted_fields"]
-        else None
-    )
-    if duplicate_pages:
-        completeness_ratio *= 0.75
-    if name_status == "NEEDS_MANUAL_REVIEW":
-        completeness_ratio *= 0.75
-    add_component(
-        "document_completeness_consistency",
-        completeness_ratio,
-        "Based on extracted required fields; OCR completeness does not prove authenticity.",
-    )
-    score_components["three_month_balance_stability"]["evidence"] = {
-        "monthly_closing_balances": [
-            {"month": item["month"], "closing_balance": item["closingBalance"], "source_page": item["sourcePage"], "source": item["source"]}
-            for item in monthly_checks
-        ],
-        "complete_three_month_period": period_complete,
-    }
-    score_components["transaction_history_quality"]["evidence"] = {
-        "valid_transaction_count": complete_transaction_count,
-        "total_transaction_count": len(transaction_records),
-        "invalid_transaction_count": len(normalized_result["invalid_transactions"]),
-        "duplicate_transaction_count": len(duplicate_transactions),
-        "reconciliation_status": reconciliation["status"],
-    }
-    score_components["source_of_funds_consistency"]["evidence"] = {
-        "recurring_source_count": len(recurring_sources),
-        "recurring_months": [
-            sorted(item["months"]) for item in recurring_sources
-        ],
-    }
-    score_components["document_completeness_consistency"]["evidence"] = {
-        "extracted_fields": completeness["extracted_fields"],
-        "required_fields": completeness["required_fields"],
-        "missing_fields": completeness["missing_fields"],
-        "duplicate_page_count": len(duplicate_pages),
-        "account_holder_status": name_status,
-    }
-    bank_score = (
-        round(
-            sum(component["points"] or 0 for component in score_components.values()), 2
-        )
-        if ocr_complete
-        else None
-    )
-    bank_score_maximum = sum(
-        float(value) for value in weights.values()
-    )
-    bank_score_available = ocr_complete and any(
-        component["available"] for component in score_components.values()
-    )
-    # Keep the raw 50-point score and its evidence coverage separate. A
-    # percentage alone can look deceptively strong when OCR missed components.
-    available_points_maximum = sum(
-        component["maximum"]
-        for component in score_components.values()
-        if component["available"]
-    )
-    evidence_coverage_percentage = (
-        round((available_points_maximum / bank_score_maximum) * 100, 2)
-        if bank_score_available and bank_score_maximum > 0
-        else 0.0
-    )
-    bank_score_percentage = (
-        round((bank_score / bank_score_maximum) * 100, 2)
-        if bank_score is not None
-        and bank_score_maximum > 0
-        and ocr_complete
-        and financial_requirement_status != "INSUFFICIENT_DATA"
-        and evidence_coverage_percentage >= 80
-        else None
-    )
     if not ocr_complete:
-        for component in score_components.values():
-            component["points"] = None
-            component["available"] = False
-            component["evidence_ratio"] = None
         financial = {
             **financial,
             "financial_score": None,
@@ -930,6 +2607,11 @@ def analyze_bank_statement(
                     if check.get("closingBalance") is not None
                     else month_row.get("closing_balance")
                 ),
+                "minimumRequired": check.get("minimumRequired"),
+                "differenceFromMinimum": check.get("differenceFromMinimum"),
+                "shortfall": check.get("shortfall"),
+                "minimumBalanceStatus": check.get("minimumBalanceStatus")
+                or "INSUFFICIENT_DATA",
                 "minimumObservedBalance": month_row.get("minimum_observed_balance"),
                 "currency": statement_currency or financial.get("currency"),
                 "closingBalanceEvidenceAvailable": bool(
@@ -944,19 +2626,33 @@ def analyze_bank_statement(
         missing_evidence.append("statement_start_date")
     if period_end is None:
         missing_evidence.append("statement_end_date")
-    if _number(fields.get("openingBalance", fields.get("opening_balance"))) is None:
+    if period_opening_balance is None:
         missing_evidence.append("opening_balance")
-    if _number(fields.get("closingBalance", fields.get("closing_balance"))) is None:
+    if (
+        latest_month_check is None
+        or latest_month_check.get("closingBalance") is None
+        or latest_month_check.get("ambiguous")
+    ):
         missing_evidence.append("closing_balance")
-    if not transaction_records:
-        missing_evidence.append("transaction_history")
-    if len(monthly_checks) != 3 or any(item["closingBalance"] is None for item in monthly_checks):
-        missing_evidence.append("three_month_closing_balance_evidence")
+    in_period_transaction_records = []
+    if month_keys and period_end:
+        scoring_start = date.fromisoformat(f"{month_keys[0]}-01")
+        in_period_transaction_records = [
+            item
+            for item in transaction_records
+            if (tx_date := _date(item.get("date") or item.get("transactionDate")))
+            and scoring_start <= tx_date <= period_end
+        ]
+    if not in_period_transaction_records:
+        missing_evidence.append("latest_three_month_transaction_history")
     if not applicant_name:
         missing_evidence.append("applicant_name_for_account_holder_comparison")
     if not statement_currency:
         missing_evidence.append("statement_currency")
 
+    recurring_sources = [
+        item for item in source_patterns.values() if len(item["months"]) >= 2
+    ]
     recurring_source_output = [
         {
             "category": item["category"],
@@ -1003,23 +2699,22 @@ def analyze_bank_statement(
         "statementPeriod": {
             "startDate": period_start.isoformat() if period_start else None,
             "endDate": period_end.isoformat() if period_end else None,
+            "scoringStartDate": (
+                f"{month_keys[0]}-01" if len(month_keys) == 3 else None
+            ),
+            "scoringEndDate": period_end.isoformat() if period_end else None,
             "completeThreeMonths": period_complete,
             "monthsEvaluated": month_keys,
-            "status": "VERIFIED" if period_complete else "INSUFFICIENT_DATA",
+            "status": "COMPLETE" if period_complete else "INSUFFICIENT_DATA",
             "evidenceSource": "explicit extracted statement-period fields",
         },
+        "periodOpeningBalance": period_opening_balance,
+        "periodOpeningBalanceAmbiguous": period_opening_ambiguous,
+        "periodOpeningBalanceEvidence": period_opening_candidates,
         "monthlyBalanceChecks": monthly_checks,
         "monthlyBalanceHistory": serialized_monthly_balance_history,
-        "averageMonthlyClosingBalance": round(sum(available_closings) / len(available_closings), 2)
-        if available_closings
-        else None,
-        "lowestMonthlyClosingBalance": min(available_closings)
-        if available_closings
-        else None,
-        "highestMonthlyClosingBalance": max(available_closings)
-        if available_closings
-        else None,
         "minimumMonthlyClosingBalanceUsd": threshold,
+        "minimumBalanceAssessment": minimum_balance_assessment,
         "transactionSummary": {
             "totalDeposits": financial.get("total_deposits"),
             "totalWithdrawals": financial.get("total_withdrawals"),
@@ -1053,43 +2748,6 @@ def analyze_bank_statement(
         "extractionWarnings": list(normalized_result["warnings"]),
         "financialAnalysis": financial,
         "documentVerificationScore": completeness,
-        "bankStatementScore": {
-            "points": bank_score if bank_score_available else None,
-            "maximum": bank_score_maximum,
-            "percentage": bank_score_percentage if bank_score_available else None,
-            "evidenceCoveragePercentage": evidence_coverage_percentage,
-            "available": bank_score_available,
-            "assessment": (
-                "INSUFFICIENT_DATA"
-                if not ocr_complete
-                or financial_requirement_status == "INSUFFICIENT_DATA"
-                or evidence_coverage_percentage < 80
-                else "BELOW_REQUIREMENT"
-                if financial_requirement_status == "FAIL"
-                else "GOOD"
-                if bank_score_percentage is not None and bank_score_percentage >= 80
-                else "FAIR"
-                if bank_score_percentage is not None and bank_score_percentage >= 65
-                else "WEAK"
-            ),
-            "assessmentNote": (
-                "The score is provisional because required statement evidence is missing or less than 80% of the scoring weight is supported."
-                if not ocr_complete
-                or financial_requirement_status == "INSUFFICIENT_DATA"
-                or evidence_coverage_percentage < 80
-                else "At least one required monthly closing balance is below the configured minimum."
-                if financial_requirement_status == "FAIL"
-                else "Score reflects extracted evidence only; authenticity and visa approval are not confirmed."
-            ),
-            "availablePointsMaximum": available_points_maximum,
-            "components": score_components,
-            "formula": (
-                "20 points monthly balance stability + 15 transaction history "
-                "quality + 10 source-of-funds consistency + 5 document "
-                "completeness/consistency; each component uses the configured "
-                "weight and its evidence ratio."
-            ),
-        },
         "reviewReasons": list(dict.fromkeys(flag["reason"] for flag in flags)),
         "disclaimer": (
             "Automated OCR and consistency checks only. This report does not "

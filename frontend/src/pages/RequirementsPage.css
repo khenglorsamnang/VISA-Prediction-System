@@ -381,23 +381,24 @@
 
 .vreq-requirement-editor {
   display: grid;
-  grid-template-columns: 31px minmax(0, 1fr);
-  gap: 11px;
-  border: 1px solid #e8ebf1;
-  border-radius: 11px;
-  padding: 13px;
-  background: #fbfcfe;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 13px;
+  border: 1px solid #e6eaf2;
+  border-radius: 13px;
+  padding: 16px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(23, 35, 60, 0.025);
 }
 
 .vreq-requirement-number {
   display: grid;
-  width: 29px;
-  height: 29px;
+  width: 34px;
+  height: 34px;
   place-items: center;
-  border-radius: 9px;
-  color: #52689e;
-  background: #eef2fb;
-  font-size: 10px;
+  border-radius: 10px;
+  color: #315ee8;
+  background: #edf2ff;
+  font-size: 11px;
   font-weight: 800;
 }
 
@@ -437,6 +438,9 @@
 }
 
 .vreq-requirement-fields .vreq-input-icon input {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
   width: 100%;
   min-width: 0;
   min-height: 37px;
@@ -567,6 +571,30 @@
   margin-top: 17px;
   border-top: 1px solid #eef0f4;
   padding-top: 16px;
+}
+
+.vreq-point-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  border: 1px solid #dde5f7;
+  border-radius: 999px;
+  padding: 7px 11px;
+  color: #65728a;
+  background: #f7f9ff;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.vreq-point-summary strong {
+  min-width: 44px;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #244bc4;
+  background: #edf2ff;
+  text-align: center;
+  font-size: 11px;
 }
 
 .vreq-list-header {
@@ -1188,9 +1216,59 @@
   align-items: end;
 }
 .vreq-requirement-fields-simple .vreq-remove-requirement { margin-bottom: 3px; }
+.vreq-requirement-details {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 2px;
+  padding-top: 14px;
+  border-top: 1px solid #eef1f6;
+}
+
+.vreq-requirement-details .vreq-field {
+  gap: 5px;
+}
+
+.vreq-requirement-details .vreq-field > input,
+.vreq-requirement-details .vreq-field > select {
+  min-height: 40px;
+  height: 40px;
+  border: 1px solid #dfe4ed;
+  border-radius: 9px;
+  padding: 0 11px;
+  background: #fff;
+  color: var(--vreq-ink);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.vreq-requirement-details .vreq-field:last-child {
+  grid-column: 1 / -1;
+}
+
+.vreq-requirement-details .vreq-field input:focus,
+.vreq-requirement-details .vreq-field select:focus {
+  border-color: #8ca6f5;
+  box-shadow: 0 0 0 3px rgba(49, 94, 232, 0.08);
+  outline: 0;
+}
+
 @media (max-width: 700px) {
   .vreq-requirement-fields.vreq-requirement-fields-simple {
     grid-template-columns: minmax(0, 1fr) minmax(72px, 95px) auto;
   }
   .vreq-requirement-fields.vreq-requirement-fields-simple .vreq-field:first-child { grid-column: auto; }
+  .vreq-requirement-editor {
+    grid-template-columns: 28px minmax(0, 1fr);
+    gap: 9px;
+  }
+  .vreq-requirement-number {
+    width: 28px;
+    height: 28px;
+  }
+  .vreq-requirement-details {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

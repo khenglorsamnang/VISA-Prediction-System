@@ -253,17 +253,6 @@ const resources = {
       passportNumberTitle: "Passport Number",
       dateOfBirthTitle: "Date of Birth",
       addressTitle: "Address",
-      predictionInputsTitle: "Optional prediction inputs",
-      predictionInputsNote:
-        "Only provide accurate information. Estimates remain unavailable unless a validated model supports the supplied data.",
-      employmentStatusTitle: "Employment status",
-      monthlyIncomeTitle: "Monthly income (USD)",
-      monthlyExpensesTitle: "Monthly expenses (USD)",
-      travelHistoryTitle: "Previous international trips",
-      previousVisaDenialsTitle: "Previous visa denials",
-      accountHistoryTitle: "Bank account history (months)",
-      overstayHistoryTitle: "Previous overstay",
-      tiesToCambodiaTitle: "Documented ties to Cambodia",
       visaDocumentChecklist: "Visa Document Checklist",
       requiredDocumentsReady: "required documents ready",
       requiredDocumentCompletion: "Required document completion",
@@ -289,7 +278,8 @@ const resources = {
       photoOcrNotRequired: "Photo checks are used; OCR is not required.",
       bankStatementFieldCheck: "Required bank fields extracted",
       bankStatementCheckUnavailable: "Not available",
-      bankScore: "Bank score: {{points}} / {{maximum}} points",
+      bankScore:
+        "Bank score: {{points}} / {{maximum}} points ({{percentage}}%)",
       bankScoreUnavailable:
         "Bank score unavailable · maximum {{maximum}} points",
       documentReadingFailed: "Document reading failed. Please retry.",
@@ -364,7 +354,7 @@ const resources = {
       verificationOutcome: "Automated document check result",
       readinessScore: "Document completeness score",
       noApprovalPrediction:
-        "The automated check confirms required documents were uploaded and OCR completed. It does not confirm authenticity or predict visa approval.",
+        "Document check only · not an authenticity or visa decision.",
       automatedDocumentCheckExplanation:
         "OCR completed and this document is included in the automated completeness check. Authenticity is not confirmed.",
       verificationPassed: "Document check complete",
@@ -638,6 +628,9 @@ const resources = {
       returnDate: "Return date",
       japanTravelDatesRequired:
         "Travel start and return dates are required for this Japan visa.",
+      dateComponentsOutOfRange:
+        "Day must be 01–31 and month must be 01–12.",
+      invalidCalendarDate: "Enter a real calendar date.",
       returnDateAfterDeparture:
         "Return date must be after the travel start date.",
       ocrCandidateReview:
@@ -870,17 +863,6 @@ const resources = {
       passportNumberTitle: "លេខលិខិតឆ្លងដែន",
       dateOfBirthTitle: "ថ្ងៃខែឆ្នាំកំណើត",
       addressTitle: "អាសយដ្ឋាន",
-      predictionInputsTitle: "ព័ត៌មានបន្ថែមសម្រាប់ការព្យាករណ៍ (ជាជម្រើស)",
-      predictionInputsNote:
-        "សូមបញ្ចូលតែព័ត៌មានត្រឹមត្រូវ។ ការប៉ាន់ស្មាននឹងមិនមានទេ ប្រសិនបើគ្មានម៉ូដែលដែលបានផ្ទៀងផ្ទាត់ និងទិន្នន័យគាំទ្រ។",
-      employmentStatusTitle: "ស្ថានភាពការងារ",
-      monthlyIncomeTitle: "ប្រាក់ចំណូលប្រចាំខែ (USD)",
-      monthlyExpensesTitle: "ចំណាយប្រចាំខែ (USD)",
-      travelHistoryTitle: "ចំនួនដំណើរអន្តរជាតិមុនៗ",
-      previousVisaDenialsTitle: "ចំនួនការបដិសេធទិដ្ឋាការមុន",
-      accountHistoryTitle: "ប្រវត្តិគណនីធនាគារ (ខែ)",
-      overstayHistoryTitle: "ធ្លាប់ស្នាក់លើសកាលកំណត់",
-      tiesToCambodiaTitle: "មានឯកសារបញ្ជាក់ចំណងទាក់ទងនៅកម្ពុជា",
       visaDocumentChecklist: "បញ្ជីឯកសារទិដ្ឋាការ",
       requiredDocumentsReady: "នៃឯកសារចាំបាច់បានត្រៀមរួច",
       requiredDocumentCompletion: "ការបំពេញឯកសារចាំបាច់",
@@ -906,7 +888,8 @@ const resources = {
       photoOcrNotRequired: "ប្រើការត្រួតពិនិត្យរូបថត; មិនចាំបាច់ប្រើ OCR ទេ។",
       bankStatementFieldCheck: "វាលធនាគារចាំបាច់ដែល OCR បានស្រង់",
       bankStatementCheckUnavailable: "មិនមានទិន្នន័យ",
-      bankScore: "ពិន្ទុរបាយការណ៍ធនាគារ៖ {{points}} / {{maximum}} ពិន្ទុ",
+      bankScore:
+        "ពិន្ទុរបាយការណ៍ធនាគារ៖ {{points}} / {{maximum}} ពិន្ទុ ({{percentage}}%)",
       bankScoreUnavailable:
         "មិនអាចគណនាពិន្ទុធនាគារបាន · អតិបរមា {{maximum}} ពិន្ទុ",
       documentReadingFailed: "ការអានឯកសារបរាជ័យ។ សូមព្យាយាមម្តងទៀត។",
@@ -981,7 +964,7 @@ const resources = {
       verificationOutcome: "លទ្ធផលត្រួតពិនិត្យឯកសារស្វ័យប្រវត្តិ",
       readinessScore: "ពិន្ទុភាពពេញលេញឯកសារ",
       noApprovalPrediction:
-        "ការត្រួតពិនិត្យស្វ័យប្រវត្តិបញ្ជាក់តែថាឯកសារចាំបាច់បានផ្ទុកឡើង និង OCR បានបញ្ចប់ប៉ុណ្ណោះ។ វាមិនបញ្ជាក់ភាពពិតប្រាកដ ឬទាយលទ្ធផលទិដ្ឋាការទេ។",
+        "ពិនិត្យឯកសារប៉ុណ្ណោះ · មិនមែនការបញ្ជាក់ភាពពិត ឬសម្រេចទិដ្ឋាការទេ។",
       automatedDocumentCheckExplanation:
         "OCR បានបញ្ចប់ ហើយឯកសារនេះត្រូវបានរាប់ក្នុងការត្រួតពិនិត្យភាពពេញលេញស្វ័យប្រវត្តិ។ មិនបានបញ្ជាក់ភាពពិតប្រាកដទេ។",
       verificationPassed: "ការត្រួតពិនិត្យឯកសារបានបញ្ចប់",
@@ -1254,6 +1237,9 @@ const resources = {
       returnDate: "ថ្ងៃត្រឡប់",
       japanTravelDatesRequired:
         "ត្រូវបញ្ចូលថ្ងៃចាប់ផ្តើម និងថ្ងៃត្រឡប់សម្រាប់ទិដ្ឋាការជប៉ុននេះ។",
+      dateComponentsOutOfRange:
+        "ថ្ងៃត្រូវនៅចន្លោះ ០១–៣១ ហើយខែត្រូវនៅចន្លោះ ០១–១២។",
+      invalidCalendarDate: "សូមបញ្ចូលកាលបរិច្ឆេទត្រឹមត្រូវ។",
       returnDateAfterDeparture: "ថ្ងៃត្រឡប់ត្រូវនៅក្រោយថ្ងៃចាប់ផ្តើមធ្វើដំណើរ។",
       ocrCandidateReview:
         "ព័ត៌មានដែល OCR អានបានគឺជាព័ត៌មានសម្រាប់ផ្ទៀងផ្ទាត់។ សូមបញ្ជាក់ ឬកែតម្រូវ ព្រោះ OCR មិនអាចបញ្ជាក់ភាពត្រឹមត្រូវពិតប្រាកដនៃឯកសារបានទេ។",

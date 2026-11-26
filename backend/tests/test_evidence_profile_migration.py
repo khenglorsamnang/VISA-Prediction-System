@@ -18,7 +18,7 @@ def test_migration_preserves_legacy_allocation_and_creates_only_unpublished_draf
     draft=drafts[0]
     assert draft["status"]=="DRAFT"
     assert draft["requirements"][0]["weight"]==90
-    assert draft["migrationWarnings"]
+    assert draft["migrationWarnings"] == []
     assert draft["migrationSourceHash"]==content_hash(draft)
     assert draft["_id"]==plan_drafts([{"_id":"visa"}],source,"upgrade-1")[0]["_id"]
 

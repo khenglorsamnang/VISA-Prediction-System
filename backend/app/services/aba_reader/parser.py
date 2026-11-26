@@ -103,7 +103,7 @@ def parse_pdf(data, filename, password="", progress=None, cancelled=None, force_
         if not 1 <= len(doc) <= 300:
             raise ParseError("Upload a PDF with 1-300 pages.")
         s = {"filename": Path(filename).name, "holder": None, "account": None, "account_type": None,
-             "currency": None, "bank": "ABA Bank", "start": None, "end": None, "opening": None,
+             "currency": None, "bank": None, "start": None, "end": None, "opening": None,
              "ending": None, "reported_in": None, "reported_out": None, "transactions": [],
              "pages": len(doc), "page_sizes": [], "extraction_issues": [], "methods": [], "identity_notices": [],
              "direction": "ascending", "audit": [], "metadata_sources": {}}
@@ -171,25 +171,77 @@ def parse_pdf(data, filename, password="", progress=None, cancelled=None, force_
                 progress(index+1,len(doc))
         first=texts[0]
         alltext="\n".join(texts)
-        # Separate date matches avoid assumptions about the dash's Unicode representation.
         period_line=re.search(r"For\s+period:[^\n]*",first)
         dates=DATE.findall(period_line[0]) if period_line else []
         if len(dates)>=2:
             s["start"],s["end"]=map(parse_date,dates[:2])
-        for key,label in [("opening","Opening Balance"),("ending","Ending Balance"),("reported_in","Total Money In"),("reported_out","Total Money Out")]:
-            match=re.search(label+r"\s*[-+]?\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|KHR)",first,re.I)
-            if match:
-                s[key]=cents(match[1]);s["metadata_sources"][key]={"page":1,"raw":match[0]}
+            s["metadata_sources"]["start"]={"page":1,"raw":period_line[0]}
+            s["metadata_sources"]["end"]={"page":1,"raw":period_line[0]}
+        amount_fields = (
+            ("opening", "Opening Balance", range(len(texts))),
+            ("ending", "Ending Balance", range(len(texts))),
+            ("reported_in", "Total Money In", range(len(texts))),
+            ("reported_out", "Total Money Out", range(len(texts))),
+        )
+        for key,label,page_indexes in amount_fields:
+            candidates=[]
+            for page_index in page_indexes:
+                for match in re.finditer(label+r"\s*[-+]?\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|KHR)",texts[page_index],re.I):
+                    candidates.append((page_index+1,match[0],cents(match[1])))
+            unique_values={candidate[2] for candidate in candidates}
+            if len(unique_values)>1:
+                s["extraction_issues"].append({
+                    "code":"summary_field_conflict",
+                    "message":f"Conflicting {label.lower()} values were extracted from multiple pages.",
+                    "field":key,
+                    "pages":[candidate[0] for candidate in candidates],
+                })
+                s["metadata_sources"][key]={"candidates":[
+                    {"page":page,"raw":raw,"value":value}
+                    for page,raw,value in candidates
+                ]}
+            elif candidates:
+                page,raw,value=candidates[-1]
+                s[key]=value
+                s["metadata_sources"][key]={"page":page,"raw":raw}
         def field(label):
             match=re.search(label+r"\s+([^\n]+)",first)
             return match[1].strip() if match else None
         s["holder"]=field("Account Holder Name")
+        holder_match=re.search(r"Account Holder Name\s+([^\n]+)",first)
+        if holder_match:
+            s["metadata_sources"]["holder"]={"page":1,"raw":holder_match[0]}
         raw_account=field(r"Account No\.") or ""
         digits=re.sub(r"\D","",raw_account)
         s["account"]="•••• "+digits[-4:] if digits else None
+        account_match=re.search(r"Account No\.\s+([^\n]+)",first)
+        if account_match:
+            s["metadata_sources"]["account"]={
+                "page":1,
+                "masked":s["account"],
+                "label":"Account No.",
+            }
         s["account_type"]=field("Account Type")
         currency=field("Account Currency")
         s["currency"]=currency.split()[0] if currency else None
+        if currency:
+            s["metadata_sources"]["currency"]={
+                "page":1,
+                "raw":re.search(r"Account Currency\s+[^\n]+",first)[0],
+            }
+        bank_match=re.search(r"\b(?:ABA\s+BANK|ADVANCED BANK OF ASIA(?:\s+LTD\.?)?)\b",alltext,re.I)
+        if bank_match:
+            s["bank"]="ABA Bank"
+            for page_index,text in enumerate(texts):
+                page_match=re.search(r"\b(?:ABA\s+BANK|ADVANCED BANK OF ASIA(?:\s+LTD\.?)?)\b",text,re.I)
+                if page_match:
+                    s["metadata_sources"]["bank"]={"page":page_index+1,"raw":page_match[0]}
+                    break
+        else:
+            s["extraction_issues"].append({
+                "code":"bank_name_unreadable",
+                "message":"The bank name could not be identified from the statement text.",
+            })
         if "ABA" not in alltext.upper() or "ACCOUNT STATEMENT" not in alltext.upper():
             s["extraction_issues"].append({"code":"unsupported_bank","message":"The document could not be identified as an ABA account statement."})
         if page_numbers != list(range(1,len(doc)+1)):
@@ -210,8 +262,4 @@ def parse_pdf(data, filename, password="", progress=None, cancelled=None, force_
             reversed_rows=list(reversed(rows))
             if all(a["date"]<=b["date"] for a,b in zip(reversed_rows,reversed_rows[1:])) and valid_order(reversed_rows):
                 s["transactions"]=reversed_rows;s["direction"]="descending normalized using reconciliation"
-        name_words=set(re.findall(r"[a-z]+",Path(filename).stem.lower()))-{"bank","statement","months","month","last"}
-        holder_words=set(re.findall(r"[a-z]+",(s["holder"] or "").lower()))
-        if name_words and holder_words and not name_words.intersection(holder_words):
-            s["identity_notices"].append("Filename and printed account holder appear different. Confirm the intended account holder; this does not change the financial score.")
         return s

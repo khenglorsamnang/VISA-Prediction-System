@@ -52,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("visadoc-ocr")
 
 MAX_FILE_SIZE = int(
-    os.getenv("MAX_FILE_SIZE", str(10 * 1024 * 1024))
+    os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024))
 )
 
 MAX_TEXT_LENGTH = 100_000

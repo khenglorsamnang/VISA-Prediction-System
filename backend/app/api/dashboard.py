@@ -10,6 +10,7 @@ from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import PyMongoError
 
 from ..core.errors import APIError
+from ..services.document_metrics import requirement_awarded_points
 from .dependencies import get_mongo_database
 from .mongo_helpers import id_query, public_document
 
@@ -127,6 +128,20 @@ async def dashboard(
                 or application.get("visaTypeCode", "")
             ) or application.get("visaTypeCode", "")
             requirement_snapshot = application.get("requirementSnapshot") or []
+            if not requirement_snapshot:
+                requirement_snapshot = await database["visarequirements"].find(
+                    {
+                        "visaTypeId": application.get("visaTypeId"),
+                        "status": "ACTIVE",
+                    }
+                ).to_list(length=None)
+                requirement_snapshot = [
+                    {
+                        **item,
+                        "requirementId": str(item.get("_id") or ""),
+                    }
+                    for item in requirement_snapshot
+                ]
             application_id = str(application.get("_id") or "")
             enriched["documentVerification"] = []
             for document in documents:
@@ -142,8 +157,14 @@ async def dashboard(
                     ),
                     {},
                 )
-                analysis = document.get("bankStatementAnalysis") or {}
-                bank_score = analysis.get("bankStatementScore")
+                maximum = requirement.get(
+                    "maximumEarnedPoints",
+                    requirement.get("weight", requirement.get("points", 0)),
+                ) or 0
+                score = {
+                    "points": requirement_awarded_points(requirement, document),
+                    "maximum": maximum,
+                }
                 enriched["documentVerification"].append(
                     {
                         "documentId": str(document.get("_id") or ""),
@@ -153,21 +174,7 @@ async def dashboard(
                         or document.get("fileName")
                         or "Document",
                         "status": str(document.get("status") or "PENDING").upper(),
-                        "score": (
-                            {
-                                "points": bank_score.get("points"),
-                                "maximum": bank_score.get("maximum"),
-                            }
-                            if isinstance(bank_score, dict)
-                            and bank_score.get("available")
-                            else {
-                                "points": document.get("awardedPoints") or 0,
-                                "maximum": requirement.get(
-                                    "weight", requirement.get("points", 0)
-                                )
-                                or 0,
-                            }
-                        ),
+                        "score": score,
                     }
                 )
             recent_applications.append(enriched)

@@ -2,24 +2,51 @@ from typing import Any
 
 import pytest
 
-from backend.app.api.requirements import _public_requirement, _validate
+from backend.app.api.requirements import (
+    _public_requirement,
+    _validate,
+    _validate_configuration_total,
+)
 
 
-@pytest.mark.parametrize("weight", [0, 100, 12.5, "20"])
-def test_requirement_points_accept_values_between_zero_and_one_hundred(
-    weight: Any,
-) -> None:
+@pytest.mark.parametrize("weight", [0, 1, 100, 12.5, "20"])
+def test_requirement_points_accept_valid_numbers(weight: Any) -> None:
     assert _validate({"weight": weight}) is None
 
 
 @pytest.mark.parametrize(
     "weight",
-    [-0.1, 100.1, float("nan"), float("inf"), "invalid", True, None],
+    [-1, -0.5, 101, 1_000_000_000, float("nan"), float("inf"), "invalid", True, None],
 )
-def test_requirement_points_reject_values_outside_zero_to_one_hundred(
+def test_requirement_points_reject_invalid_values(
     weight: Any,
 ) -> None:
     assert _validate({"weight": weight}) == "Points must be between 0 and 100."
+
+
+def test_active_requirement_total_cannot_exceed_100() -> None:
+    assert _validate_configuration_total([
+        {"status": "ACTIVE", "weight": 60},
+        {"status": "ACTIVE", "weight": 50},
+        {"status": "INACTIVE", "weight": 500},
+    ]) == "Active requirements total cannot exceed 100 points. Remaining points: 40"
+
+
+def test_active_requirement_total_accepts_100() -> None:
+    assert _validate_configuration_total([
+        {"status": "ACTIVE", "weight": 60},
+        {"status": "ACTIVE", "weight": 40},
+        {"status": "INACTIVE", "weight": 500},
+    ]) is None
+
+
+@pytest.mark.parametrize("weight", [101, 1_000_000_000, -1, 12.75, "invalid"])
+def test_requirement_points_reject_out_of_range_or_invalid(weight: Any) -> None:
+    expected = "Points must be between 0 and 100."
+    if weight == 12.75:
+        assert _validate({"weight": weight}) is None
+    else:
+        assert _validate({"weight": weight}) == expected
 
 
 def test_photo_rules_accept_visa_specific_thresholds_and_manual_review():

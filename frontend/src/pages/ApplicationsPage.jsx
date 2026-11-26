@@ -4,7 +4,12 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { CheckCircle2, Clock3, FileText, MapPin, Pencil } from "lucide-react";
 import ApplicationCreator from "../components/ApplicationCreator";
 import RequirementChecklist from "../components/RequirementChecklist";
-import { api, useSecureData, waitForDocumentOcr } from "./pageUtils";
+import {
+  api,
+  getRequirementMaxFileSize,
+  useSecureData,
+  waitForDocumentOcr,
+} from "./pageUtils";
 
 export default function ApplicationsPage({ profile = {} }) {
   const { t, i18n } = useTranslation();
@@ -389,14 +394,15 @@ export default function ApplicationsPage({ profile = {} }) {
       "png",
     ];
     const extension = file.name.split(".").pop()?.toLowerCase();
+    const maxFileSize = getRequirementMaxFileSize(requirement);
     if (
       (!formats.includes(extension) &&
         !(extension === "jpg" && formats.includes("jpeg")) &&
         !(extension === "jpeg" && formats.includes("jpg"))) ||
-      file.size > (requirement.maxFileSize || 10 * 1024 * 1024)
+      file.size > maxFileSize
     ) {
       setError(
-        `${t("useAcceptedFile")} (${formats.join(", ")}) ${t("upTo")} ${((requirement.maxFileSize || 10 * 1024 * 1024) / 1024 / 1024).toFixed(1)} ${t("mb")}.`,
+        `${t("useAcceptedFile")} (${formats.join(", ")}) ${t("upTo")} ${(maxFileSize / 1024 / 1024).toFixed(1)} ${t("mb")}.`,
       );
       return;
     }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Check, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api } from '../pages/pageUtils';
 import './Integration.css';
@@ -21,7 +21,7 @@ function AssessmentHistory({ entries = [] }) {
   const ordered = [...entries].filter(entry => entry && typeof entry === 'object').sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
   if (!ordered.length) return <details className="mt-5"><summary>Assessment history (0)</summary><p className="integration-note">No reassessments or rubric reviews have been recorded for this application.</p></details>;
   const slotKey = slot => String(slot.slotId || slot.requirementId || slot.name || '');
-  const total = assessment => assessment?.confirmedReadinessPoints ?? assessment?.documentAssessmentScore ?? assessment?.earnedPoints;
+  const total = assessment => assessment?.earnedPoints ?? assessment?.confirmedReadinessPoints ?? assessment?.documentAssessmentScore;
   return <details className="mt-5"><summary>Assessment history ({ordered.length})</summary>
     <p className="integration-note">Read-only comparisons from recorded assessments. Times use Asia/Phnom_Penh. Reconstructed figures are labeled and do not establish what the historical evidence contained.</p>
     {ordered.map((entry, index) => {
@@ -63,34 +63,52 @@ function QualityReview({ slot, requirement, documents, applicationId, onChange }
   return <form onSubmit={save} className="integration-quality-form"><h3 className="font-semibold mb-3">Review: {slot.name}</h3><p className="integration-note">A quality review records evidence strength. The document must separately be verified before these points become confirmed.</p><div className="integration-form-grid"><label>Evidence document<select required value={documentId} onChange={e=>{setDocumentId(e.target.value);setReason('');setScores({});setLevel('');}}><option value="">Choose an uploaded document</option>{options.map(d=><option key={d.documentId} value={d.documentId}>{d.fileName} · {d.status}</option>)}</select></label>{rubric.levels?<label>Rubric level<select required value={level} onChange={e=>setLevel(e.target.value)}><option value="">Choose the evidenced level</option>{rubric.levels.map(l=><option key={l.id} value={l.id}>{l.label||l.id} · {(Number(l.quality)*100).toFixed(0)}% quality</option>)}</select></label>:rubric.criteria?.map(c=><label key={c.id}>{c.label||c.id} (0–{c.maximumPoints})<input required type="number" min="0" max={c.maximumPoints} step="0.01" value={scores[c.id]??''} onChange={e=>setScores(s=>({...s,[c.id]:e.target.value}))}/></label>)}</div><label>Reason and source references<textarea required minLength={8} rows={2} value={reason} onChange={e=>setReason(e.target.value)}/></label>{error&&<p role="alert" className="integration-error">{error}</p>}<div className="integration-actions"><button disabled={busy||!documentId||reason.trim().length<8} type="submit"><Check size={16}/>Record rubric review</button></div></form>;
 }
 
-export default function EvidenceAssessmentPanel({ results, applicationId, canManage, onChange }) {
+export default function EvidenceAssessmentPanel({ results, applicationId, canManage, canRecalculate, onChange }) {
   const summary=results.summary||{};const application=results.application||{};const prediction=results.prediction||{};
-  const slots=summary.requirementScores||[];const canonical=summary.scoringVersion==='evidence-v3';
-  const [profiles,setProfiles]=useState([]);const [chosen,setChosen]=useState('');const [reason,setReason]=useState('');const [error,setError]=useState('');const [busy,setBusy]=useState(false);const [reviewSlot,setReviewSlot]=useState('');
-  useEffect(()=>{if(!canManage||!application.visaTypeId)return;let active=true;api.get('/policy-profiles',{params:{visaTypeId:application.visaTypeId}}).then(r=>{if(active)setProfiles((r.data.profiles||[]).filter(p=>p.status==='PUBLISHED'));}).catch(e=>{if(active)setError(e.response?.data?.message||'Could not load published policy versions.');});return()=>{active=false;};},[canManage,application.visaTypeId]);
+  const slots=summary.requirementScores||[];const canonical=['evidence-v3','document-requirements-v3'].includes(summary.scoringVersion);
+  const [reason,setReason]=useState('');const [error,setError]=useState('');const [busy,setBusy]=useState(false);const [reviewSlot,setReviewSlot]=useState('');
   async function download(kind){setError('');try{const r=await api.get(`/assessments/${applicationId}/exports/${kind}`,{responseType:'blob'});const url=URL.createObjectURL(r.data);const a=document.createElement('a');a.href=url;a.download=`evidence-assessment.${kind}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(e){setError('Could not export this authorized assessment. Refresh and try again.');}}
   async function verify(){setBusy(true);setError('');try{await api.post('/verification/run',{applicationId});await onChange();}catch(e){setError(e.response?.data?.message||e.message);}finally{setBusy(false);}}
-  async function reassess(e){e.preventDefault();setBusy(true);setError('');try{await api.post(`/policy-profiles/applications/${applicationId}/reassess`,{policyVersionId:chosen,reason});setReason('');await onChange();}catch(err){setError(err.response?.data?.message||err.message);}finally{setBusy(false);}}
+  async function reassess(e){e.preventDefault();setBusy(true);setError('');try{await api.post(`/requirements/applications/${applicationId}/recalculate`,{reason});setReason('');await onChange();}catch(err){setError(err.response?.data?.message||err.message);}finally{setBusy(false);}}
   const probability=prediction.approvalProbabilityNormalized??(prediction.approvalProbability==null?null:Number(prediction.approvalProbability)/100);
+  const earnedPoints=summary.confirmedReadinessPoints??summary.earnedPoints??summary.documentAssessmentScore??0;
+  const maximumPoints=summary.maximumPoints??summary.totalAvailablePoints??0;
+  const documentPercentage=summary.documentAssessmentScore;
+  const gateCount=(summary.gates||[]).length;
   return <section className="integration-panel" aria-label="Canonical evidence assessment">
-    <div className="integration-heading"><div><h2>Evidence strength and prediction</h2></div><ShieldCheck size={23}/></div>
+    <div className="integration-heading"><div><h2>Document assessment</h2><p>Evidence score and review status</p></div><ShieldCheck size={23}/></div>
     {error&&<p role="alert" className="integration-error">{error}</p>}
     <div className="integration-disclosure-grid">
-      <div><small>Confirmed evidence strength</small><strong className="integration-number">{canonical?summary.confirmedReadinessPoints??'—':summary.documentAssessmentScore??'—'} <small>/ 100</small></strong>
-        <p className="integration-note">{canonical ? String(summary.status||'Review required').toLowerCase().replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase()) : 'Legacy assessment'}</p>
-        {summary.completionRange && Number(summary.completionRange.upper)>Number(summary.completionRange.lower) && <p className="integration-note">Potential after review: {summary.completionRange.lower}–{summary.completionRange.upper} points.</p>}
+      <div className="integration-assessment-score">
+        <small>Document score</small>
+        <strong className="integration-number">{points(earnedPoints)} <small>/ {points(maximumPoints)}</small></strong>
+        <div className="integration-score-meta">
+          <span>{documentPercentage==null?'Percentage unavailable':`${points(documentPercentage)}%`}</span>
+          <span className={summary.status === "VERIFIED" ? "is-complete" : "needs-review"}>
+            {canonical ? String(summary.status||'Review required').toLowerCase().replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase()) : 'Legacy assessment'}
+          </span>
+        </div>
+        {summary.completionRange && Number(summary.completionRange.upper)>Number(summary.completionRange.lower) && <p className="integration-note">Possible after review: {summary.completionRange.lower}–{summary.completionRange.upper} points.</p>}
       </div>
       <div className="integration-probability"><small>Estimated visa approval probability</small><strong className="integration-number">{probability==null||prediction.status!=='COMPLETED'?'Unavailable':`${(probability*100).toFixed(1)}%`}</strong>
-        <p className="integration-note">{prediction.status==='STALE'?'Evidence changed. Refresh the assessment.':probability==null?'A validated model and verified inputs are required.':`Model ${prediction.modelVersion||'—'}`}</p>
+        <p className="integration-note">{prediction.status==='STALE'?'Assessment is out of date.':probability==null?'No validated estimate available.':`Model ${prediction.modelVersion||'—'}`}</p>
       </div>
     </div>
-    <p className="integration-note">Evidence points are not an approval probability.</p>
-    <details className="mt-4"><summary>Assessment details</summary><dl className="integration-note"><dt>Policy</dt><dd>{summary.policyVersion||'legacy'} · {summary.policyVersionId||application.policyVersionId||'No published profile selected'}</dd><dt>Normalized evidence score</dt><dd>{summary.confirmedReadinessNormalized==null?'Unavailable':Number(summary.confirmedReadinessNormalized).toFixed(4)}</dd></dl></details>
-    {(summary.gates||[]).map((g,i)=><div className="integration-warning" key={g.slotId||i}><strong>{g.name||'Assessment gate'}</strong><ul className="list-disc pl-5">{(g.reasons||[g.reason||g]).map((r,j)=><li key={j}>{String(r)}</li>)}</ul></div>)}
-    <div className="integration-table-wrap" role="region" aria-label="Evidence points ledger" tabIndex={0}><table className="integration-table"><thead><tr><th>Requirement slot</th><th>Mode</th><th>Quality</th><th>Confirmed points</th><th>Maximum</th><th>State / reason</th></tr></thead><tbody>{slots.map((s,i)=><tr key={s.slotId||s.requirementId||i}><td className="integration-description">{s.name}<small className="block text-slate-500">{s.required?'Required for final assessment':'Optional / supplemental'}</small></td><td>{s.scoringMode||'Legacy'}</td><td>{s.quality==null?'Unknown':`${(Number(s.quality)*100).toFixed(2)}%`}</td><td>{s.earnedPoints??0}</td><td>{s.configuredPoints??s.maximumEarnedPoints??0}</td><td className="integration-description">{s.status}{s.reasons?.length>0&&<p>{s.reasons.join('; ')}</p>}{canManage&&canonical&&results.requirements?.some(r=>r.requirementId===s.requirementId&&r.qualityScorer==='MANUAL_RUBRIC')&&<button type="button" onClick={()=>setReviewSlot(reviewSlot===s.slotId?'':s.slotId)}>Review quality rubric</button>}</td></tr>)}</tbody></table></div>
+    {gateCount>0&&<details className="integration-warning">
+      <summary>{gateCount} item{gateCount===1?'':'s'} need review</summary>
+      {(summary.gates||[]).map((g,i)=><div className="mt-2" key={g.slotId||i}><strong>{g.name||'Assessment gate'}</strong><ul className="list-disc pl-5">{(g.reasons||[g.reason||g]).map((r,j)=><li key={j}>{String(r)}</li>)}</ul></div>)}
+    </details>}
+    <details className="integration-assessment-details">
+      <summary>Scoring breakdown · {slots.length} requirements</summary>
+      <dl className="integration-note"><dt>Requirements configuration</dt><dd>{application.requirementsConfigurationVersion??'Legacy snapshot'}</dd><dt>Normalized evidence score</dt><dd>{summary.confirmedReadinessNormalized==null?'Unavailable':Number(summary.confirmedReadinessNormalized).toFixed(4)}</dd></dl>
+      <div className="integration-table-wrap" role="region" aria-label="Evidence points ledger" tabIndex={0}><table className="integration-table"><thead><tr><th>Requirement</th><th>Mode</th><th>Quality</th><th>Points</th><th>Maximum</th><th>Status</th></tr></thead><tbody>{slots.map((s,i)=><tr key={s.slotId||s.requirementId||i}><td className="integration-description">{s.name}<small className="block text-slate-500">{s.required?'Required':'Optional'}</small></td><td>{s.scoringMode||'Legacy'}</td><td>{s.quality==null?'Unknown':`${(Number(s.quality)*100).toFixed(2)}%`}</td><td>{s.earnedPoints??0}</td><td>{s.configuredPoints??s.maximumEarnedPoints??0}</td><td className="integration-description">{s.status}{s.reasons?.length>0&&<p>{s.reasons.join('; ')}</p>}{canManage&&canonical&&results.requirements?.some(r=>r.requirementId===s.requirementId&&r.qualityScorer==='MANUAL_RUBRIC')&&<button type="button" onClick={()=>setReviewSlot(reviewSlot===s.slotId?'':s.slotId)}>Review quality rubric</button>}</td></tr>)}</tbody></table></div>
+    </details>
     {canManage&&canonical&&reviewSlot&&slots.filter(s=>s.slotId===reviewSlot).map(s=><QualityReview key={`${s.slotId}-${s.selectedDocumentId}`} slot={s} requirement={results.requirements?.find(r=>r.requirementId===s.requirementId)} documents={results.documents||[]} applicationId={applicationId} onChange={onChange}/>)}
-    <div className="integration-actions">{['json','csv','html'].map(kind=><button type="button" key={kind} onClick={()=>download(kind)}>Export {kind.toUpperCase()}</button>)}</div>
+    <details className="integration-assessment-details">
+      <summary>Export assessment</summary>
+      <div className="integration-actions">{['json','csv','html'].map(kind=><button type="button" key={kind} onClick={()=>download(kind)}>Export {kind.toUpperCase()}</button>)}</div>
+    </details>
     <AssessmentHistory entries={results.assessmentHistory || []} />
-    {canManage&&<><div className="integration-actions"><button type="button" disabled={busy} onClick={verify}><RefreshCw size={16}/>Refresh assessment and verification</button></div><details className="mt-5"><summary>Explicitly reassess against another published policy</summary><p className="integration-note">This creates a new assessment history entry and invalidates dependent predictions. It does not change the original recorded result.</p><form onSubmit={reassess} className="integration-review-form"><label>Published policy<select required value={chosen} onChange={e=>setChosen(e.target.value)}><option value="">Choose the reviewed version</option>{profiles.map(p=><option key={p._id} value={p._id}>{p.name} · {p.version}</option>)}</select></label><label>Reassessment reason<input required minLength={5} value={reason} onChange={e=>setReason(e.target.value)}/></label><div className="integration-actions"><button disabled={busy||!chosen||reason.trim().length<5} type="submit">Reassess with selected policy</button></div></form></details></>}
+    {canManage&&<><div className="integration-actions"><button type="button" disabled={busy} onClick={verify}><RefreshCw size={16}/>Refresh assessment and verification</button></div>{canRecalculate&&<details className="mt-5"><summary>Recalculate using current Requirements Management configuration</summary><p className="integration-note">This explicitly replaces the application's saved requirement snapshot, records an audit entry, and invalidates dependent predictions. Other applications keep their original snapshots.</p><form onSubmit={reassess} className="integration-review-form"><label>Recalculation reason<input required minLength={5} value={reason} onChange={e=>setReason(e.target.value)}/></label><div className="integration-actions"><button disabled={busy||reason.trim().length<5} type="submit">Recalculate from current requirements</button></div></form></details>}</>}
   </section>;
 }

@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertCircle, CheckCircle2, CloudUpload, FileText } from "lucide-react";
-import { waitForDocumentOcr } from "../pages/pageUtils";
+import {
+  AlertCircle,
+  CalendarDays,
+  CheckCircle2,
+  CloudUpload,
+  FileText,
+} from "lucide-react";
+import {
+  getRequirementMaxFileSize,
+  waitForDocumentOcr,
+} from "../pages/pageUtils";
 
 const EMPTY_APPLICANT = {
   fullName: "",
@@ -11,14 +20,6 @@ const EMPTY_APPLICANT = {
   passportNumber: "",
   dateOfBirth: "",
   address: "",
-  employmentStatus: "",
-  monthlyIncomeUsd: "",
-  monthlyExpensesUsd: "",
-  travelHistoryCount: "",
-  previousVisaDenials: "",
-  hasOverstayHistory: "",
-  accountHistoryMonths: "",
-  proofOfTiesToCambodia: "",
 };
 
 // These fields identify the applicant and are required before an application
@@ -30,34 +31,114 @@ const REQUIRED_APPLICANT_FIELDS = [
   "dateOfBirth",
 ];
 const APPLICANT_FIELDS = Object.keys(EMPTY_APPLICANT);
-const PREDICTION_FIELDS = [
-  ["employmentStatus", "employmentStatusTitle", "text"],
-  ["monthlyIncomeUsd", "monthlyIncomeTitle", "number"],
-  ["monthlyExpensesUsd", "monthlyExpensesTitle", "number"],
-  ["travelHistoryCount", "travelHistoryTitle", "number"],
-  ["previousVisaDenials", "previousVisaDenialsTitle", "number"],
-  ["accountHistoryMonths", "accountHistoryTitle", "number"],
-  ["hasOverstayHistory", "overstayHistoryTitle", "boolean"],
-  ["proofOfTiesToCambodia", "tiesToCambodiaTitle", "boolean"],
-];
-
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_DATE = new Date().toISOString().slice(0, 10);
-const BOOLEAN_APPLICANT_FIELDS = [
-  "hasOverstayHistory",
-  "proofOfTiesToCambodia",
-];
-const normalizeOptionalBoolean = (value) => {
-  if (value === true || value === false || value === "") return value;
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    if (normalized === "true") return true;
-    if (normalized === "false") return false;
-  }
-  return "";
-};
 const humanSize = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const formatPoints = (points) => Number(points.toFixed(1));
+const KHMER_DIGITS = "០១២៣៤៥៦៧៨៩";
+
+function normalizeDateDigits(value) {
+  return String(value)
+    .replace(/[០-៩]/g, (digit) => String(KHMER_DIGITS.indexOf(digit)))
+    .replace(/\D/g, "")
+    .slice(0, 8);
+}
+
+function formatDateDigits(digits, language) {
+  let formatted = digits;
+  if (digits.length >= 4) {
+    formatted = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+  } else if (digits.length >= 2) {
+    formatted = `${digits.slice(0, 2)}/${digits.slice(2)}`;
+  }
+  return language === "kh"
+    ? formatted.replace(/\d/g, (digit) => KHMER_DIGITS[Number(digit)])
+    : formatted;
+}
+
+function dateComponentsAreValid(digits) {
+  if (digits.length >= 1 && Number(digits[0]) > 3) return false;
+  if (digits.length >= 2) {
+    const day = Number(digits.slice(0, 2));
+    if (day < 1 || day > 31) return false;
+  }
+  if (digits.length >= 3 && Number(digits[2]) > 1) return false;
+  if (digits.length >= 4) {
+    const month = Number(digits.slice(2, 4));
+    if (month < 1 || month > 12) return false;
+  }
+  return true;
+}
+
+function updateDateInput(
+  event,
+  language,
+  setDraft,
+  setDate,
+  setDateInputError,
+  currentDraft,
+  componentRangeError,
+  calendarDateError,
+) {
+  const input = event.currentTarget;
+  const value = input.value;
+  const cursor = input.selectionStart ?? value.length;
+  const digits = normalizeDateDigits(value);
+  if (!dateComponentsAreValid(digits)) {
+    const previousValue = formatDateDigits(
+      normalizeDateDigits(currentDraft),
+      language,
+    );
+    input.value = previousValue;
+    const position = Math.min(cursor, previousValue.length);
+    input.setSelectionRange(position, position);
+    setDateInputError(componentRangeError);
+    return;
+  }
+  const digitsBeforeCursor = normalizeDateDigits(value.slice(0, cursor)).length;
+  const formatted = formatDateDigits(digits, language);
+  const date = isoDateFromDigits(digits);
+  setDraft(formatted);
+  setDate(date);
+  setDateInputError(digits.length === 8 && !date ? calendarDateError : "");
+
+  window.requestAnimationFrame(() => {
+    if (document.activeElement !== input) return;
+    let position = 0;
+    let digitCount = 0;
+    while (position < formatted.length && digitCount < digitsBeforeCursor) {
+      if (/[0-9០-៩]/.test(formatted[position])) digitCount += 1;
+      position += 1;
+    }
+    if (digitsBeforeCursor > 0 && formatted[position] === "/") {
+      position += 1;
+    }
+    input.setSelectionRange(position, position);
+  });
+}
+
+function dateDigitsFromIso(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+  return match ? `${match[3]}${match[2]}${match[1]}` : "";
+}
+
+function isoDateFromDigits(digits) {
+  if (digits.length !== 8) return "";
+  const day = digits.slice(0, 2);
+  const month = digits.slice(2, 4);
+  const year = digits.slice(4);
+  if (Number(year) < 1) return "";
+  const value = `${year}-${month}-${day}`;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+    ? value
+    : "";
+}
+
+function formatTravelDate(value, language) {
+  const digits = dateDigitsFromIso(value);
+  return digits ? formatDateDigits(digits, language) : value || "—";
+}
 
 function VerificationResultPanel({
   verifying,
@@ -74,12 +155,14 @@ function VerificationResultPanel({
   const maximumPoints =
     verificationResult?.maximumPoints ?? verificationResult?.totalPoints ?? 0;
   const pointsSummary = verificationResult
-    ? t("pointsToPercentage", {
-        earned: formatPoints(Number(earnedPoints) || 0),
-        total: formatPoints(Number(maximumPoints) || 0),
-        percentage: readinessScore || 0,
-      })
+    ? `${formatPoints(Number(earnedPoints) || 0)} / ${formatPoints(Number(maximumPoints) || 0)} ${t("points")}`
     : "";
+  const reviewItems = (verificationResult?.results || []).filter(
+    (item) => !["PASS", "NOT_APPLICABLE"].includes(item.status),
+  );
+  const nonBankReviewItems = reviewItems.filter(
+    (item) => !item.bankStatements?.length,
+  );
   if (!verifying && !verificationResult) return null;
 
   return (
@@ -115,8 +198,8 @@ function VerificationResultPanel({
           {t("verificationRunning")}
         </p>
       ) : verificationResult ? (
-        <div className="grid gap-4 md:grid-cols-[minmax(0,220px)_1fr]">
-          <div className="rounded-xl border border-slate-200 bg-white p-4">
+        <div className="grid items-start gap-4 md:grid-cols-[minmax(0,220px)_1fr]">
+          <div className="h-fit rounded-xl border border-slate-200 bg-white p-4">
             <p className="text-sm font-medium text-slate-600">
               {t("readinessScore")}
             </p>
@@ -153,17 +236,13 @@ function VerificationResultPanel({
           </div>
           <div className="space-y-2">
             <p className="text-sm font-semibold text-slate-700">
-              {verificationResult.results?.some(
-                (item) => !["PASS", "NOT_APPLICABLE"].includes(item.status),
-              )
+              {reviewItems.length
                 ? t("checksToReview")
                 : t("allChecksPassed")}
             </p>
-            {verificationResult.results
-              ?.filter(
-                (item) => !["PASS", "NOT_APPLICABLE"].includes(item.status),
-              )
-              .map((item) => (
+            {nonBankReviewItems
+              .map((item) => {
+                return (
                 <div
                   key={item.requirementId}
                   className={`rounded-xl border p-3 ${
@@ -185,72 +264,125 @@ function VerificationResultPanel({
                     </span>
                   </div>
                   <p className="mt-1 text-xs font-medium text-slate-500">
-                    {formatPoints(Number(item.earnedPoints) || 0)} /{" "}
-                    {formatPoints(Number(item.configuredPoints) || 0)} points
-                    {" · "}
-                    {Number(item.scoreWeightPercent || 0).toFixed(2)}% of
-                    total score
+                    {`${formatPoints(Number(item.earnedPoints) || 0)} / ${formatPoints(Number(item.configuredPoints) || 0)} ${t("points")}`}
                   </p>
                   <p className="mt-1 text-sm text-slate-700">
                     {verificationExplanation(item)}
                   </p>
                 </div>
-              ))}
+                );
+              })}
             {verificationResult.results
               ?.flatMap((item) => item.bankStatements || [])
-              .map(({ documentId, documentReference, analysis }) => (
-                <div
-                  key={documentId}
-                  className="rounded-xl border border-blue-100 bg-blue-50 p-3"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="font-medium text-slate-900">
-                      Bank statement · {documentReference}
-                    </span>
-                    <span className="text-sm font-semibold text-blue-900">
-                      {analysis.bankStatementScore?.available
-                        ? t("bankScore", {
-                            points: analysis.bankStatementScore.points,
-                            maximum: analysis.bankStatementScore.maximum,
-                          })
-                        : t("bankScoreUnavailable", {
-                            maximum:
-                              analysis.bankStatementScore?.maximum ?? 50,
-                          })}
-                    </span>
+              .map(({ documentId, documentReference, analysis }) => {
+                const score =
+                  analysis.computedBankScore ?? analysis.bankStatementScore;
+                const scoreAvailable =
+                  score?.available &&
+                  score.points != null &&
+                  Number.isFinite(Number(score.points)) &&
+                  Number(score.maximum) > 0;
+                const percentage = scoreAvailable
+                  ? (
+                      (Number(score.points) / Number(score.maximum)) *
+                      100
+                    ).toFixed(2)
+                  : null;
+                const riskReasonCounts = new Map();
+                (analysis.riskFlags || []).forEach((flag) => {
+                  if (
+                    flag.reason &&
+                    flag.code !== "PERIOD_END_BALANCE_BELOW_REQUIRED"
+                  ) {
+                    riskReasonCounts.set(
+                      flag.reason,
+                      (riskReasonCounts.get(flag.reason) || 0) + 1,
+                    );
+                  }
+                });
+                const riskReasons = [...riskReasonCounts.entries()];
+                return (
+                  <div
+                    key={documentId}
+                    className="rounded-xl border border-teal-100 bg-teal-50/60 p-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium text-slate-900">
+                        Bank statement · {documentReference}
+                      </span>
+                      <span className="text-sm font-semibold text-teal-900">
+                        {scoreAvailable
+                          ? t("bankScore", {
+                              points: Number(score.points).toFixed(2),
+                              maximum: score.maximum,
+                              percentage,
+                            })
+                          : t("bankScoreUnavailable", {
+                              maximum: score?.maximum ?? 45,
+                            })}
+                      </span>
+                    </div>
+                    {analysis.monthlyBalanceChecks?.length ? (
+                      <>
+                      <p className="mt-3 text-xs font-semibold text-slate-700">
+                        Monthly closing balances <span className="font-normal text-slate-500">· supporting evidence</span>
+                      </p>
+                      <ul className="mt-2 grid gap-2 text-xs text-slate-600 sm:grid-cols-3">
+                        {analysis.monthlyBalanceChecks.map((month) => {
+                          const formatUsd = (value) => {
+                            const amount = Number(value);
+                            return value == null || !Number.isFinite(amount)
+                              ? "Unavailable"
+                              : `USD ${amount.toLocaleString("en-US", {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                })}`;
+                          };
+                          const belowMinimum =
+                            month.minimumBalanceStatus === "BELOW_MINIMUM";
+                          return (
+                            <li key={month.month} className="rounded-md border border-teal-100 bg-white/80 p-2">
+                              <strong className="text-slate-800">{month.month}</strong>
+                              {" · "}
+                              {belowMinimum ? (
+                                <span className="font-medium text-amber-800">Below minimum · manual review</span>
+                              ) : month.closingBalance == null ? (
+                                "Balance unavailable"
+                              ) : (
+                                `${String(month.currency || "USD").toUpperCase()} ${Number(month.closingBalance).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                              )}
+                              {belowMinimum && (
+                                <span className="mt-1 block text-amber-900">
+                                  Closing balance: {formatUsd(month.closingBalance)} · Minimum: {formatUsd(month.minimumRequired)} · Shortfall: {formatUsd(month.shortfall)}
+                                </span>
+                              )}
+                              {month.sourcePage && <span className="mt-1 block text-slate-500">Page {month.sourcePage}{month.sourceTransaction ? ` · row ${month.sourceTransaction}` : ""}</span>}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      </>
+                    ) : (
+                      <p className="mt-2 text-xs text-amber-800">
+                        Three complete months of USD closing-balance evidence
+                        were not available.
+                      </p>
+                    )}
+                    {riskReasons.length > 0 && (
+                      <details className="mt-2 text-xs text-amber-900">
+                        <summary className="cursor-pointer font-semibold">
+                          Review note types · {riskReasons.length}
+                        </summary>
+                        <ul className="mt-2 list-disc space-y-1 pl-5">
+                          {riskReasons.map(([reason, count]) => (
+                            <li key={reason}>{reason}{count > 1 ? ` · ${count} transactions` : ""}</li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
                   </div>
-                  <p className="mt-1 text-xs text-slate-700">
-                    Three-month balance check:{" "}
-                    {analysis.financialRequirementStatus || "INSUFFICIENT_DATA"} ·{" "}
-                    {analysis.status || "NEEDS_MANUAL_REVIEW"}
-                  </p>
-                  {analysis.monthlyBalanceChecks?.length ? (
-                    <ul className="mt-2 grid gap-1 text-xs text-slate-600 sm:grid-cols-3">
-                      {analysis.monthlyBalanceChecks.map((month) => (
-                        <li key={month.month}>
-                          {month.month}: {month.currency || ""}{" "}
-                          {month.closingBalance ?? "—"} · {month.status}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-2 text-xs text-amber-800">
-                      Three complete months of USD closing-balance evidence
-                      were not available.
-                    </p>
-                  )}
-                  {analysis.riskFlags?.length > 0 && (
-                    <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-900">
-                      {analysis.riskFlags.slice(0, 5).map((flag, index) => (
-                        <li key={`${flag.code}-${index}`}>{flag.reason}</li>
-                      ))}
-                    </ul>
-                  )}
-                  <p className="mt-2 text-[11px] text-slate-500">
-                    OCR and consistency analysis only; authenticity is not confirmed.
-                  </p>
-                </div>
-              ))}
+                );
+              })}
           </div>
         </div>
       ) : null}
@@ -283,7 +415,10 @@ export default function ApplicationCreator({
   const [applicant, setApplicant] = useState(EMPTY_APPLICANT);
   const [visaTypeId, setVisaTypeId] = useState("");
   const [travelStartDate, setTravelStartDate] = useState("");
+  const [travelStartDateDraft, setTravelStartDateDraft] = useState("");
   const [returnDate, setReturnDate] = useState("");
+  const [returnDateDraft, setReturnDateDraft] = useState("");
+  const [dateInputError, setDateInputError] = useState("");
   const [requirements, setRequirements] = useState([]);
   const [requirementsLoading, setRequirementsLoading] = useState(false);
   const [requirementsError, setRequirementsError] = useState("");
@@ -296,6 +431,10 @@ export default function ApplicationCreator({
   const [activeStep, setActiveStep] = useState(0);
 
   const selectedVisaType = visaTypes.find((item) => item._id === visaTypeId);
+  const dateFormatHint =
+    i18n.language === "kh"
+      ? "សូមបញ្ចូលថ្ងៃ/ខែ/ឆ្នាំ (ឧ. ១២/០៣/២០២៦)"
+      : "Enter day/month/year (e.g. 12/03/2026)";
   const requiredRequirements = useMemo(
     () => requirements.filter((item) => item.required),
     [requirements],
@@ -344,11 +483,9 @@ export default function ApplicationCreator({
     let active = true;
     if (!visaTypeId) return () => { active = false; };
 
-    api.get(`/policy-profiles/effective/visa-type/${visaTypeId}`)
-      .then(async response => {
-        const pinned=response.data.profile?.requirements;
-        if (pinned) { if(active)setRequirements(pinned.map(r=>({...r,_id:r.requirementId||r._id}))); }
-        else { const legacy=await api.get("/requirements",{params:{visaTypeId}}); if(active)setRequirements(legacy.data.requirements||[]); }
+    api.get("/requirements", { params: { visaTypeId } })
+      .then((response) => {
+        if (active) setRequirements(response.data.requirements || []);
       })
       .catch((requestError) => {
         if (active)
@@ -374,12 +511,7 @@ export default function ApplicationCreator({
         ? Object.fromEntries(
             Object.keys(EMPTY_APPLICANT).map((field) => {
               const value = customer[field] ?? "";
-              return [
-                field,
-                BOOLEAN_APPLICANT_FIELDS.includes(field)
-                  ? normalizeOptionalBoolean(value)
-                  : value,
-              ];
+              return [field, value];
             }),
           )
         : EMPTY_APPLICANT,
@@ -403,8 +535,8 @@ export default function ApplicationCreator({
       "png",
     ];
     const extension = file?.name.split(".").pop()?.toLowerCase();
-    const maxFileSize = Math.min(
-      Number(requirement.maxFileSize) || MAX_FILE_SIZE,
+    const maxFileSize = getRequirementMaxFileSize(
+      requirement,
       MAX_FILE_SIZE,
     );
     if (
@@ -727,11 +859,6 @@ export default function ApplicationCreator({
       let targetCustomer = customers.find((item) => item._id === customerId);
       if (!targetApplication) {
         const applicantPayload = { ...applicant };
-        for (const field of BOOLEAN_APPLICANT_FIELDS) {
-          applicantPayload[field] = normalizeOptionalBoolean(
-            applicantPayload[field],
-          );
-        }
         const customerResponse = customerId
           ? await api.put(`/customers/${customerId}`, applicantPayload)
           : await api.post("/customers", {
@@ -777,7 +904,10 @@ export default function ApplicationCreator({
     setApplicant(EMPTY_APPLICANT);
     setVisaTypeId("");
     setTravelStartDate("");
+    setTravelStartDateDraft("");
     setReturnDate("");
+    setReturnDateDraft("");
+    setDateInputError("");
     setRequirements([]);
     setFiles({});
     setDocumentAvailable({});
@@ -931,62 +1061,6 @@ export default function ApplicationCreator({
               }
             />
           </label>
-          <div className="sm:col-span-2 lg:col-span-3">
-            <h4 className="font-semibold text-slate-800">
-              {t("predictionInputsTitle")}
-            </h4>
-            <p className="mt-1 text-xs text-slate-500">
-              {t("predictionInputsNote")}
-            </p>
-          </div>
-          {PREDICTION_FIELDS.map(([field, label, type]) => (
-            <label key={field} className="text-sm font-medium text-slate-700">
-              {t(label)}
-              {type === "boolean" ? (
-                <select
-                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5"
-                  value={
-                    applicant[field] === true
-                      ? "true"
-                      : applicant[field] === false
-                        ? "false"
-                        : ""
-                  }
-                  disabled={Boolean(application)}
-                  onChange={(event) =>
-                    setApplicant((current) => ({
-                      ...current,
-                      [field]:
-                        event.target.value === ""
-                          ? ""
-                          : event.target.value === "true",
-                    }))
-                  }
-                >
-                  <option value="">Not provided</option>
-                  <option value="true">Yes</option>
-                  <option value="false">No</option>
-                </select>
-              ) : (
-                <input
-                  type={type}
-                  min={type === "number" ? 0 : undefined}
-                  step={
-                    type === "number" && field.includes("Usd") ? "0.01" : "1"
-                  }
-                  className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 disabled:bg-slate-50"
-                  value={applicant[field]}
-                  disabled={Boolean(application)}
-                  onChange={(event) =>
-                    setApplicant((current) => ({
-                      ...current,
-                      [field]: event.target.value,
-                    }))
-                  }
-                />
-              )}
-            </label>
-          ))}
         </div>
         </div>
       </section>
@@ -1027,25 +1101,163 @@ export default function ApplicationCreator({
             <section className="grid gap-4 sm:grid-cols-2">
               <label className="text-sm font-medium text-slate-700">
                 {t("travelStartDate")}
-                <input
-                  type="date"
-                  disabled={Boolean(application)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:bg-slate-50"
-                  value={travelStartDate}
-                  onChange={(event) => setTravelStartDate(event.target.value)}
-                />
+                <div className="relative mt-1.5">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={10}
+                    aria-describedby="travel-start-date-format"
+                    placeholder={
+                      i18n.language === "kh" ? "ថ្ងៃ/ខែ/ឆ្នាំ" : "DD/MM/YYYY"
+                    }
+                    disabled={Boolean(application)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3 pr-12 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:bg-slate-50"
+                    value={formatDateDigits(
+                      normalizeDateDigits(travelStartDateDraft),
+                      i18n.language,
+                    )}
+                    onChange={(event) =>
+                      updateDateInput(
+                        event,
+                        i18n.language,
+                        setTravelStartDateDraft,
+                        setTravelStartDate,
+                        setDateInputError,
+                        travelStartDateDraft,
+                        t("dateComponentsOutOfRange"),
+                        t("invalidCalendarDate"),
+                      )
+                    }
+                    onBlur={() => {
+                      const date = isoDateFromDigits(
+                        normalizeDateDigits(travelStartDateDraft),
+                      );
+                      if (date) {
+                        setTravelStartDate(date);
+                        setTravelStartDateDraft(
+                          formatDateDigits(
+                            dateDigitsFromIso(date),
+                            i18n.language,
+                          ),
+                        );
+                        setDateInputError("");
+                      }
+                    }}
+                  />
+                  <CalendarDays
+                    aria-hidden="true"
+                    size={18}
+                    className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+                  />
+                  <input
+                    type="date"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    disabled={Boolean(application)}
+                    lang={i18n.language === "kh" ? "km-KH-u-nu-khmr" : undefined}
+                    className="absolute inset-y-0 right-0 z-10 w-12 cursor-pointer opacity-0 disabled:cursor-not-allowed"
+                    value={travelStartDate}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setTravelStartDate(value);
+                      setTravelStartDateDraft(
+                        formatDateDigits(dateDigitsFromIso(value), i18n.language),
+                      );
+                      setDateInputError("");
+                    }}
+                  />
+                </div>
+                <span
+                  id="travel-start-date-format"
+                  className="mt-1.5 block text-xs font-normal text-slate-500"
+                >
+                  {dateFormatHint}
+                </span>
               </label>
               <label className="text-sm font-medium text-slate-700">
                 {t("returnDate")}
-                <input
-                  type="date"
-                  min={travelStartDate || undefined}
-                  disabled={Boolean(application)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:bg-slate-50"
-                  value={returnDate}
-                  onChange={(event) => setReturnDate(event.target.value)}
-                />
+                <div className="relative mt-1.5">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={10}
+                    aria-describedby="return-date-format"
+                    placeholder={
+                      i18n.language === "kh" ? "ថ្ងៃ/ខែ/ឆ្នាំ" : "DD/MM/YYYY"
+                    }
+                    disabled={Boolean(application)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3 pr-12 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:bg-slate-50"
+                    value={formatDateDigits(
+                      normalizeDateDigits(returnDateDraft),
+                      i18n.language,
+                    )}
+                    onChange={(event) =>
+                      updateDateInput(
+                        event,
+                        i18n.language,
+                        setReturnDateDraft,
+                        setReturnDate,
+                        setDateInputError,
+                        returnDateDraft,
+                        t("dateComponentsOutOfRange"),
+                        t("invalidCalendarDate"),
+                      )
+                    }
+                    onBlur={() => {
+                      const date = isoDateFromDigits(
+                        normalizeDateDigits(returnDateDraft),
+                      );
+                      if (date) {
+                        setReturnDate(date);
+                        setReturnDateDraft(
+                          formatDateDigits(
+                            dateDigitsFromIso(date),
+                            i18n.language,
+                          ),
+                        );
+                        setDateInputError("");
+                      }
+                    }}
+                  />
+                  <CalendarDays
+                    aria-hidden="true"
+                    size={18}
+                    className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+                  />
+                  <input
+                    type="date"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    min={travelStartDate || undefined}
+                    disabled={Boolean(application)}
+                    lang={i18n.language === "kh" ? "km-KH-u-nu-khmr" : undefined}
+                    className="absolute inset-y-0 right-0 z-10 w-12 cursor-pointer opacity-0 disabled:cursor-not-allowed"
+                    value={returnDate}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setReturnDate(value);
+                      setReturnDateDraft(
+                        formatDateDigits(dateDigitsFromIso(value), i18n.language),
+                      );
+                      setDateInputError("");
+                    }}
+                  />
+                </div>
+                <span
+                  id="return-date-format"
+                  className="mt-1.5 block text-xs font-normal text-slate-500"
+                >
+                  {dateFormatHint}
+                </span>
               </label>
+              {dateInputError && (
+                <p
+                  role="alert"
+                  className="sm:col-span-2 text-sm text-red-600"
+                >
+                  {dateInputError}
+                </p>
+              )}
             </section>
           )}
           </div>
@@ -1107,6 +1319,10 @@ export default function ApplicationCreator({
                 "jpeg",
                 "png",
               ];
+              const maxFileSize = getRequirementMaxFileSize(
+                requirement,
+                MAX_FILE_SIZE,
+              );
               const isUploaded = fileState.status === "Uploaded";
               const isUploading = fileState.status === "Uploading";
               const isReady = hasRequirementFile(requirement);
@@ -1168,7 +1384,7 @@ export default function ApplicationCreator({
                             : requirement.description[i18n.language] || requirement.description.en)}
                       </p>
                       <p className="mt-1 text-xs text-slate-400">
-                        {formats.join(", ").toUpperCase()} · {t("maximum")} {humanSize(requirement.maxFileSize || MAX_FILE_SIZE)}
+                        {formats.join(", ").toUpperCase()} · {t("maximum")} {humanSize(maxFileSize)}
                       </p>
                       <label className="mt-3 inline-flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-700">
                         <input
@@ -1356,8 +1572,8 @@ export default function ApplicationCreator({
                   <dl className="space-y-1 text-sm text-slate-700">
                     <div><dt className="inline font-medium">{t("visaType")}: </dt><dd className="inline">{selectedVisaType ? `${selectedVisaType.visaTypeCode} · ${selectedVisaType.name}` : "—"}</dd></div>
                     <div><dt className="inline font-medium">{t("country")}: </dt><dd className="inline">{selectedVisaType?.destination || "—"}</dd></div>
-                    <div><dt className="inline font-medium">{t("travelStartDate")}: </dt><dd className="inline">{travelStartDate || "—"}</dd></div>
-                    <div><dt className="inline font-medium">{t("returnDate")}: </dt><dd className="inline">{returnDate || "—"}</dd></div>
+                    <div><dt className="inline font-medium">{t("travelStartDate")}: </dt><dd className="inline">{formatTravelDate(travelStartDate, i18n.language)}</dd></div>
+                    <div><dt className="inline font-medium">{t("returnDate")}: </dt><dd className="inline">{formatTravelDate(returnDate, i18n.language)}</dd></div>
                   </dl>
                   <button type="button" onClick={() => goToStep(1)} className="mt-3 text-sm font-semibold text-emerald-800 hover:text-emerald-950">Edit travel details</button>
                 </div>
@@ -1463,7 +1679,7 @@ export default function ApplicationCreator({
             <h4 className="font-semibold text-emerald-800">Visa &amp; Travel</h4>
             <p className="mt-2 text-sm text-slate-700">{selectedVisaType?.destination || "Destination not selected"}</p>
             <p className="text-sm text-slate-600">{selectedVisaType?.name || "Visa type not selected"}</p>
-            {travelStartDate && <p className="mt-1 text-xs text-slate-600">{travelStartDate}{returnDate ? ` – ${returnDate}` : ""}</p>}
+            {travelStartDate && <p className="mt-1 text-xs text-slate-600">{formatTravelDate(travelStartDate, i18n.language)}{returnDate ? ` – ${formatTravelDate(returnDate, i18n.language)}` : ""}</p>}
           </section>
           <section className="rounded-xl bg-teal-50 p-3">
             <div className="flex items-center justify-between gap-2">

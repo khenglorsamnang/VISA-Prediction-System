@@ -30,7 +30,7 @@ export default function RequirementsPage() {
   const [editingVisaTypeId, setEditingVisaTypeId] = useState("");
   const [requirementForm, setRequirementForm] = useState({
     name: "",
-    weight: 10,
+    weight: "",
     required: true,
     conditional: false,
     source: "",
@@ -332,7 +332,7 @@ export default function RequirementsPage() {
       setEditingRequirementId("");
       setRequirementForm({
         name: "",
-        weight: 10,
+        weight: "",
         required: true,
         conditional: false,
         source: "",
@@ -825,8 +825,7 @@ export default function RequirementsPage() {
         />
         <input
           required
-          min="0"
-          max="100"
+          min="0.01"
           type="number"
           aria-label="Points"
           placeholder="Points"

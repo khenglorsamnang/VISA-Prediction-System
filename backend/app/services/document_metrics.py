@@ -1,49 +1,122 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
 from ..api.document_workflow import has_completed_ocr
+from .bank_statement_scoring import calculate_bank_statement_score
 from .photo_validation import is_photo_document
 
 _INACTIVE_DOCUMENT_STATES = {"DELETED", "REPLACED"}
-_SCORABLE_STATUSES = {"VERIFIED", "PARTIAL", "NEEDS_REVIEW", "INSUFFICIENT_DATA"}
 
 
 def bank_requirement_points(
     analysis: dict[str, Any] | None,
     configured_points: float,
     document_status: str = "VERIFIED",
-) -> float:
+) -> float | None:
     """Map a diagnostic bank score only when coverage/evidence is reliable."""
     if document_status.upper() != "VERIFIED" or not isinstance(analysis, dict):
+        return None
+    financial_status = str(analysis.get("financialRequirementStatus") or "").upper()
+    if financial_status in {"", "INSUFFICIENT_DATA", "NOT_AVAILABLE", "PENDING"}:
+        return None
+    if financial_status in {"FAIL", "FAILED", "REJECTED"}:
         return 0.0
-    if analysis.get("financialRequirementStatus") != "PASS":
-        return 0.0
-    diagnostic = analysis.get("bankStatementScore") or {}
+    if financial_status not in {"PASS", "BELOW_MINIMUM"}:
+        return None
+    diagnostic = (
+        analysis.get("computedBankScore")
+        or analysis.get("bankStatementScore")
+        or {}
+    )
     if not diagnostic.get("available"):
-        return 0.0
+        return None
+    components = diagnostic.get("components")
+    if isinstance(components, dict):
+        canonical_score = calculate_bank_statement_score(components)
+        if not canonical_score["available"]:
+            return None
+        diagnostic = canonical_score
     try:
         points = float(diagnostic["points"])
         maximum = float(diagnostic["maximum"])
     except (KeyError, TypeError, ValueError):
-        return 0.0
+        return None
     if maximum <= 0:
-        return 0.0
+        return None
     return round(min(configured_points, max(0.0, configured_points * points / maximum)), 2)
 
 
 def _points(requirement: dict[str, Any]) -> float:
     try:
-        return max(0.0, float(requirement.get("weight", requirement.get("points", 0)) or 0))
+        return max(
+            0.0,
+            float(
+                requirement.get(
+                    "maximumEarnedPoints",
+                    requirement.get("weight", requirement.get("points", 0)),
+                )
+                or 0
+            ),
+        )
     except (TypeError, ValueError):
         return 0.0
 
 
-def _document_points(document: dict[str, Any], maximum: float) -> float:
-    # awardedPoints is written only after evidence-based verification/review.
+def _is_bank_requirement(requirement: dict[str, Any], document: dict[str, Any]) -> bool:
+    identity = " ".join(
+        str(value or "")
+        for value in (
+            requirement.get("code"),
+            requirement.get("name"),
+            document.get("requirementCode"),
+            document.get("requirementName"),
+        )
+    ).casefold().replace("-", "_")
+    return "bank" in identity and (
+        "statement" in identity or "3 month" in identity or "3_month" in identity
+    )
+
+
+def requirement_awarded_points(
+    requirement: dict[str, Any],
+    document: dict[str, Any],
+) -> float:
+    """Derive a document's current contribution from its saved verification evidence."""
+    maximum = _points(requirement)
+    if str(document.get("status") or "").upper() != "VERIFIED":
+        return 0.0
+    if _is_bank_requirement(requirement, document):
+        contribution = bank_requirement_points(
+            document.get("bankStatementAnalysis"),
+            maximum,
+            str(document.get("status") or ""),
+        )
+        return contribution or 0.0
+    if is_photo_document(document, requirement):
+        verification = document.get("automatedVerification") or {}
+        try:
+            ratio = float(verification.get("photoPointsRatio", 1))
+        except (TypeError, ValueError):
+            ratio = 0.0
+        if not math.isfinite(ratio):
+            ratio = 0.0
+        return round(maximum * min(1.0, max(0.0, ratio)), 2)
+    return maximum if has_completed_ocr(document) else 0.0
+
+
+def _document_points(
+    document: dict[str, Any],
+    requirement: dict[str, Any],
+) -> float:
+    maximum = _points(requirement)
     try:
-        return min(maximum, max(0.0, float(document.get("awardedPoints") or 0)))
+        return min(
+            maximum,
+            max(0.0, requirement_awarded_points(requirement, document)),
+        )
     except (TypeError, ValueError):
         return 0.0
 
@@ -84,11 +157,7 @@ def summarize_documents(
     include_optional: bool = False,
     calculated_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Calculate document points from configured requirements only.
-
-    Optional requirements are excluded by the explicit default denominator policy;
-    callers can pass include_optional=True when their policy includes them.
-    """
+    """Calculate document points from the application's configured requirements."""
     excluded = {str(item) for item in (not_applicable_requirement_ids or set())}
     current = [item for item in documents if str(item.get("status") or "").upper() not in _INACTIVE_DOCUMENT_STATES]
     by_requirement: dict[str, list[dict[str, Any]]] = {}
@@ -108,15 +177,13 @@ def summarize_documents(
         attached = by_requirement.get(requirement_id, [])
         if not requirement.get("allowMultiple", False) and attached:
             attached = sorted(attached, key=lambda item: item.get("updatedAt") or item.get("createdAt") or "", reverse=True)[:1]
-        # Option B: required requirements always contribute. An optional
-        # requirement contributes only after an active file exists; a rejected
-        # active file therefore remains in the denominator until deleted.
-        included = required or bool(attached) or include_optional
         status = _status(attached)
-        awarded = min(maximum, sum(_document_points(item, maximum) for item in attached if str(item.get("status") or "").upper() in _SCORABLE_STATUSES))
-        if included:
-            total_points += maximum
-            earned_points += awarded
+        awarded = min(
+            maximum,
+            sum(_document_points(item, requirement) for item in attached),
+        )
+        total_points += maximum
+        earned_points += awarded
         if required:
             required_count += 1
             if attached:
@@ -198,7 +265,25 @@ def summarize_documents(
     pages_processed = sum(_non_negative_int(item.get("ocrPagesProcessed")) for item in current)
     calculated = calculated_at or datetime.now(timezone.utc)
     score = round(100 * earned_points / total_points, 2) if total_points else 0.0
+    complete = required_count == completed_required and processing == 0
+    gates = [
+        {
+            "slotId": item["requirementId"],
+            "name": item["name"],
+            "reasons": (
+                []
+                if item["status"] == "VERIFIED"
+                else ["Required document is not verified"]
+            ),
+        }
+        for item in requirement_scores
+        if item["required"] and item["status"] != "VERIFIED"
+    ]
     return {
+        "scoringVersion": "document-requirements-v3",
+        "status": "READY_FOR_STAFF_REVIEW" if complete else "NEEDS_REVIEW",
+        "complete": complete,
+        "gates": gates,
         "totalDocuments": len(current),
         "ocrCompletedDocuments": sum(has_completed_ocr(item) for item in current),
         "verifiedDocuments": verified,

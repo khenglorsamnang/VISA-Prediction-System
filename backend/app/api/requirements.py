@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,18 +44,41 @@ REQUIREMENT_FIELDS = (
 def _validate(payload: dict[str, Any], creating: bool = False) -> str | None:
     if creating and (not str(payload.get("name") or "").strip() or not payload.get("visaTypeId")):
         return "Requirement name and visa type are required"
+    if "name" in payload and not str(payload.get("name") or "").strip():
+        return "Requirement name is required"
+    if "code" in payload and not str(payload.get("code") or "").strip():
+        return "Requirement code is required"
+    if creating and not any(field in payload for field in ("maximumEarnedPoints", "weight")):
+        return "Maximum points are required"
     for field in ("required", "conditional", "allowMultiple", "requiredForFinalAssessment"):
         if field in payload and not isinstance(payload[field], bool):
             return f"{field} must be true or false"
-    if "weight" in payload:
-        if isinstance(payload["weight"], bool):
+    points_field = (
+        "maximumEarnedPoints"
+        if "maximumEarnedPoints" in payload
+        else "weight"
+        if "weight" in payload
+        else None
+    )
+    if points_field:
+        if isinstance(payload[points_field], bool):
             return "Points must be between 0 and 100."
         try:
-            weight = float(payload["weight"])
+            weight = float(payload[points_field])
         except (TypeError, ValueError):
             return "Points must be between 0 and 100."
-        if not math.isfinite(weight) or not 0 <= weight <= 100:
+        if (
+            not math.isfinite(weight)
+            or weight < 0
+            or weight > 100
+        ):
             return "Points must be between 0 and 100."
+        if "weight" in payload and "maximumEarnedPoints" in payload:
+            try:
+                if float(payload["weight"]) != float(payload["maximumEarnedPoints"]):
+                    return "weight and maximumEarnedPoints must match"
+            except (TypeError, ValueError):
+                return "Points must be between 0 and 100."
     for field in ("displayOrder", "maxFileSize"):
         if field in payload and payload[field] is not None:
             try:
@@ -69,9 +93,23 @@ def _validate(payload: dict[str, Any], creating: bool = False) -> str | None:
                 return f"{field} must be an integer"
     if "acceptedFormats" in payload and (
         not isinstance(payload["acceptedFormats"], list)
+        or not payload["acceptedFormats"]
         or any(not isinstance(item, str) for item in payload["acceptedFormats"])
     ):
-        return "acceptedFormats must be a list of file extensions"
+        return "acceptedFormats must be a non-empty list of file extensions"
+    if "acceptedFormats" in payload:
+        formats = {
+            item.strip().lower().lstrip(".")
+            for item in payload["acceptedFormats"]
+        }
+        if formats - {"pdf", "jpg", "jpeg", "png"}:
+            return "Only PDF, JPG, JPEG, and PNG file formats are supported"
+    if "status" in payload and str(payload["status"]).upper() not in {
+        "ACTIVE",
+        "INACTIVE",
+        "ARCHIVED",
+    }:
+        return "Status must be ACTIVE, INACTIVE, or ARCHIVED"
     if "photoRules" in payload:
         rules = payload["photoRules"]
         allowed_rules = {
@@ -125,11 +163,20 @@ def _validate(payload: dict[str, Any], creating: bool = False) -> str | None:
             - allowed_photo_formats
         ):
             return "Applicant photos support JPG, JPEG, and PNG only"
-    if any(field in payload for field in SCORING_FIELDS):
+    if any(field in payload for field in SCORING_FIELDS) or points_field:
         try:
             # A partial update's range is validated against the stored record below.
-            if creating or "maximumEarnedPoints" in payload or "weight" in payload:
-                normalize_scoring_fields(payload)
+            if creating or points_field:
+                normalize_scoring_fields(
+                    {
+                        **payload,
+                        **(
+                            {"maximumEarnedPoints": payload["weight"]}
+                            if "weight" in payload and "maximumEarnedPoints" not in payload
+                            else {}
+                        ),
+                    }
+                )
         except ValueError as error:
             return str(error)
     return None
@@ -137,6 +184,12 @@ def _validate(payload: dict[str, Any], creating: bool = False) -> str | None:
 
 def _public_requirement(requirement: dict[str, Any]) -> dict[str, Any]:
     serialized = public_document(requirement)
+    if "weight" not in serialized:
+        serialized["weight"] = serialized.get("maximumEarnedPoints", serialized.get("points", 0))
+    if "maximumEarnedPoints" not in serialized:
+        serialized["maximumEarnedPoints"] = serialized.get(
+            "weight", serialized.get("points", 0)
+        )
     rules = serialized.get("photoRules")
     if isinstance(rules, dict):
         serialized["photoRules"] = {
@@ -152,6 +205,7 @@ async def _write_history(
     admin_id: str,
     previous: dict[str, Any] | None,
     current: dict[str, Any] | None,
+    configuration_version: int,
 ) -> None:
     now = datetime.now(timezone.utc)
     await database["requirementversions"].insert_one(
@@ -161,6 +215,7 @@ async def _write_history(
             "visaTypeId": requirement.get("visaTypeId"),
             "action": action,
             "adminId": admin_id,
+            "configurationVersion": configuration_version,
             "previous": previous,
             "current": current,
             "createdAt": now,
@@ -169,52 +224,79 @@ async def _write_history(
     )
 
 
-async def _refresh_application_scores(database: AsyncDatabase, visa_type_id: Any) -> None:
-    """Refresh current scores after a policy mutation without touching documents."""
+async def _bump_configuration_version(
+    database: AsyncDatabase,
+    visa_type_id: Any,
+) -> int:
+    visa = await database["visatypes"].find_one(id_query(str(visa_type_id)))
+    if not visa:
+        raise APIError(404, "Visa type not found")
+    current = int(visa.get("requirementsConfigurationVersion") or 0)
+    version = current + 1
+    now = datetime.now(timezone.utc)
+    result = await database["visatypes"].update_one(
+        {"_id": visa["_id"], "requirementsConfigurationVersion": visa.get("requirementsConfigurationVersion")},
+        {"$set": {
+            "requirementsConfigurationVersion": version,
+            "requirementsConfigurationUpdatedAt": now,
+        }},
+    )
+    if not result.matched_count:
+        raise APIError(409, "Requirements changed concurrently; reload and retry")
+    return version
+
+
+def _validate_configuration_total(requirements: list[dict[str, Any]]) -> str | None:
+    active = [
+        item
+        for item in requirements
+        if str(item.get("status", "ACTIVE")).upper() == "ACTIVE"
+    ]
     try:
-        active = await database["visarequirements"].find(
-            {"visaTypeId": visa_type_id, "status": "ACTIVE"}
-        ).to_list(length=None)
-        applications = await database["visaapplications"].find(
-            {"visaTypeId": visa_type_id}
-        ).to_list(length=None)
-        for application in applications:
-            # Published snapshots are immutable. Editing live requirement drafts must not rewrite old evidence awards.
-            if application.get("evidencePolicySnapshot"):
-                continue
-            documents = await database["documents"].find(
-                {"applicationId": str(application.get("_id"))}
-            ).to_list(length=None)
-            summary = summarize_documents(
-                [{**item, "requirementId": str(item["_id"])} for item in active],
-                documents,
+        total = math.fsum(
+            float(
+                item.get(
+                    "maximumEarnedPoints",
+                    item.get("weight", item.get("points", 0)),
+                )
             )
-            now = datetime.now(timezone.utc)
-            snapshot = {
-                "maximumPoints": summary["maximumPoints"],
-                "earnedPoints": summary["earnedPoints"],
-                "documentAssessmentScore": summary["documentAssessmentScore"],
-                "requirementScores": summary["requirementScores"],
-                "calculatedAt": now,
-            }
-            await database["visaapplications"].update_one(
-                {"_id": application["_id"]},
-                {"$set": {
-                    "completenessScore": summary["documentAssessmentScore"],
-                    "documentReadiness": summary["documentAssessmentScore"],
-                    "earnedPoints": summary["earnedPoints"],
-                    "maximumPoints": summary["maximumPoints"],
-                    "verificationPercentage": summary["verificationPercentage"],
-                    "submissionCompleteness": summary["submissionCompleteness"],
-                    "verificationMetricsCurrent": True,
-                    "lastCalculationAt": now,
-                    "scoringVersion": "document-requirements-v2",
-                    "policyVersion": max((item.get("updatedAt") or item.get("createdAt") for item in active), default=None),
-                    "updatedAt": now,
-                }, "$push": {"scoreHistory": snapshot}},
+            for item in active
+        )
+    except (OverflowError, TypeError, ValueError):
+        return "Total maximum points must be finite"
+    if not math.isfinite(total) or total < 0:
+        return "Active maximum points must be a valid total"
+    if total > 100:
+        remaining_values = []
+        for item in active:
+            others = math.fsum(
+                float(
+                    other.get(
+                        "maximumEarnedPoints",
+                        other.get("weight", other.get("points", 0)),
+                    )
+                )
+                for other in active
+                if other is not item
             )
-    except PyMongoError:
-        logger.exception("Could not refresh application document scores after policy change")
+            remaining_values.append(max(0.0, 100 - others))
+        remaining_text = f"{min(remaining_values):.2f}".rstrip("0").rstrip(".")
+        return (
+            "Active requirements total cannot exceed 100 points. "
+            f"Remaining points: {remaining_text}"
+        )
+    return None
+
+
+def _snapshot_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **item,
+        "requirementId": str(item.get("requirementId") or item.get("_id") or ""),
+        "maximumEarnedPoints": item.get(
+            "maximumEarnedPoints",
+            item.get("weight", item.get("points", 0)),
+        ),
+    }
 
 
 @router.get("/")
@@ -285,26 +367,51 @@ async def create_requirement(
         if not visa_type:
             return JSONResponse(status_code=404, content={"message": "Visa type not found"})
         name = str(payload["name"]).strip()
-        duplicate = await database["visarequirements"].find_one(
-            {
-                **reference_query("visaTypeId", str(visa_type["_id"])),
-                "name": {"$regex": f"^{name}$", "$options": "i"},
-                "status": {"$ne": "ARCHIVED"},
-            }
+        code = str(
+            payload.get("code")
+            or re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+        ).strip().casefold()
+        existing = await database["visarequirements"].find(
+            reference_query("visaTypeId", str(visa_type["_id"]))
+        ).to_list(length=None)
+        duplicate = any(
+            str(item.get("status", "ACTIVE")).upper() != "ARCHIVED"
+            and (
+                str(item.get("name") or "").strip().casefold() == name.casefold()
+                or str(item.get("code") or "").strip().casefold() == code
+            )
+            for item in existing
         )
         if duplicate:
-            return JSONResponse(status_code=409, content={"message": "Requirement already exists for this visa type"})
+            return JSONResponse(
+                status_code=409,
+                content={"message": "Requirement name and code must be unique for this visa type"},
+            )
+        maximum = float(
+            payload.get("maximumEarnedPoints", payload.get("weight", 0))
+        )
+        candidate = {
+            "name": name,
+            "code": code,
+            "weight": maximum,
+            "maximumEarnedPoints": maximum,
+            "status": str(payload.get("status") or "ACTIVE").upper(),
+        }
+        total_error = _validate_configuration_total([*existing, candidate])
+        if total_error:
+            return JSONResponse(status_code=400, content={"message": total_error})
         now = datetime.now(timezone.utc)
         requirement = {
             "_id": ObjectId(),
             "visaTypeId": visa_type["_id"],
             "countryId": visa_type.get("countryId"),
             "name": name,
-            "code": str(payload.get("code") or name.lower().replace(" ", "_")),
+            "code": code,
             "description": payload.get("description"),
             "required": payload.get("required", True),
             "conditional": payload.get("conditional", False),
-            "weight": float(payload.get("maximumEarnedPoints", payload.get("weight", 0))),
+            "weight": maximum,
+            "maximumEarnedPoints": maximum,
             "displayOrder": int(payload.get("displayOrder", 0)),
             "maxFileSize": int(payload.get("maxFileSize", 10 * 1024 * 1024)),
             "source": str(payload.get("source") or ""),
@@ -335,8 +442,20 @@ async def create_requirement(
             requirement.update({field: payload[field] for field in SCORING_FIELDS if field in payload})
             requirement = normalize_scoring_fields(requirement)
         await database["visarequirements"].insert_one(requirement)
-        await _write_history(database, requirement, "CREATE", principal["id"], None, _public_requirement(requirement))
-        await _refresh_application_scores(database, visa_type["_id"])
+        version = await _bump_configuration_version(database, visa_type["_id"])
+        requirement["configurationVersion"] = version
+        await database["visarequirements"].replace_one(
+            {"_id": requirement["_id"]}, requirement
+        )
+        await _write_history(
+            database,
+            requirement,
+            "CREATE",
+            principal["id"],
+            None,
+            _public_requirement(requirement),
+            version,
+        )
     except DuplicateKeyError:
         return JSONResponse(status_code=409, content={"message": "Requirement already exists"})
     except PyMongoError as error:
@@ -367,7 +486,7 @@ async def requirement_history(
             if isinstance(item.get(field), dict):
                 serialized[field] = _public_requirement(item[field])
         serialized_history.append(serialized)
-    return JSONResponse(content={"history": serialized_history})
+    return JSONResponse(content={"history": serialized_history, "versions": serialized_history})
 
 
 @router.get("/{requirement_id}")
@@ -399,10 +518,35 @@ async def update_requirement(
         current = await collection.find_one(id_query(requirement_id))
         if not current:
             return JSONResponse(status_code=404, content={"message": "Requirement not found"})
+        visa_type_id = current.get("visaTypeId")
+        siblings = await collection.find(
+            reference_query("visaTypeId", str(visa_type_id))
+        ).to_list(length=None)
+        name = str(payload.get("name", current.get("name") or "")).strip()
+        code = str(
+            payload.get("code", current.get("code") or "")
+            or re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+        ).strip().casefold()
+        duplicate = any(
+            str(item.get("_id")) != str(current.get("_id"))
+            and str(item.get("status", "ACTIVE")).upper() != "ARCHIVED"
+            and (
+                str(item.get("name") or "").strip().casefold() == name.casefold()
+                or str(item.get("code") or "").strip().casefold() == code
+            )
+            for item in siblings
+        )
+        if duplicate:
+            return JSONResponse(
+                status_code=409,
+                content={"message": "Requirement name and code must be unique for this visa type"},
+            )
         updated = dict(current)
         for field in REQUIREMENT_FIELDS:
             if field in payload:
                 updated[field] = payload[field]
+        updated["name"] = name
+        updated["code"] = code
         if any(field in payload or field in current for field in SCORING_FIELDS):
             # A legacy weight-only edit updates its canonical maximum alias too.
             if "weight" in payload and "maximumEarnedPoints" not in payload:
@@ -413,7 +557,26 @@ async def update_requirement(
                 updated = normalize_scoring_fields(updated)
             except ValueError as error:
                 return JSONResponse(status_code=400, content={"message": str(error)})
+        if "weight" in payload or "maximumEarnedPoints" in payload:
+            updated["weight"] = float(
+                payload.get(
+                    "maximumEarnedPoints",
+                    payload.get("weight", current.get("weight", 0)),
+                )
+            )
+            updated["maximumEarnedPoints"] = updated["weight"]
+        total_error = _validate_configuration_total(
+            [
+                updated if str(item.get("_id")) == str(current.get("_id")) else item
+                for item in siblings
+            ]
+        )
+        if total_error:
+            return JSONResponse(status_code=400, content={"message": total_error})
         updated["updatedAt"] = datetime.now(timezone.utc)
+        await collection.replace_one({"_id": current["_id"]}, updated)
+        version = await _bump_configuration_version(database, visa_type_id)
+        updated["configurationVersion"] = version
         await collection.replace_one({"_id": current["_id"]}, updated)
         await _write_history(
             database,
@@ -422,8 +585,8 @@ async def update_requirement(
             principal["id"],
             _public_requirement(current),
             _public_requirement(updated),
+            version,
         )
-        await _refresh_application_scores(database, updated.get("visaTypeId"))
     except DuplicateKeyError:
         return JSONResponse(status_code=409, content={"message": "Requirement conflicts with an existing record"})
     except PyMongoError as error:
@@ -443,11 +606,27 @@ async def delete_requirement(
         current = await collection.find_one(id_query(requirement_id))
         if not current:
             return JSONResponse(status_code=404, content={"message": "Requirement not found"})
+        siblings = await collection.find(
+            reference_query("visaTypeId", str(current.get("visaTypeId")))
+        ).to_list(length=None)
         referenced = await database["visaapplications"].find_one(
             {"requirementSnapshot.requirementId": str(current["_id"])}
         )
         if referenced:
             updated = {**current, "status": "ARCHIVED", "updatedAt": datetime.now(timezone.utc)}
+            total_error = _validate_configuration_total(
+                [
+                    updated if str(item.get("_id")) == str(current.get("_id")) else item
+                    for item in siblings
+                ]
+            )
+            if total_error:
+                return JSONResponse(status_code=400, content={"message": total_error})
+            await collection.replace_one({"_id": current["_id"]}, updated)
+            version = await _bump_configuration_version(
+                database, current.get("visaTypeId")
+            )
+            updated["configurationVersion"] = version
             await collection.replace_one({"_id": current["_id"]}, updated)
             await _write_history(
                 database,
@@ -456,10 +635,18 @@ async def delete_requirement(
                 principal["id"],
                 public_document(current),
                 public_document(updated),
+                version,
             )
-            await _refresh_application_scores(database, updated.get("visaTypeId"))
             return JSONResponse(content={"message": "Requirement is used by applications and has been archived"})
+        total_error = _validate_configuration_total(
+            [item for item in siblings if str(item.get("_id")) != str(current.get("_id"))]
+        )
+        if total_error:
+            return JSONResponse(status_code=400, content={"message": total_error})
         await collection.delete_one({"_id": current["_id"]})
+        version = await _bump_configuration_version(
+            database, current.get("visaTypeId")
+        )
         await _write_history(
             database,
             current,
@@ -467,9 +654,168 @@ async def delete_requirement(
             principal["id"],
             public_document(current),
             None,
+            version,
         )
-        await _refresh_application_scores(database, current.get("visaTypeId"))
     except PyMongoError as error:
         logger.exception("Could not delete requirement: %s", error.__class__.__name__)
         raise APIError(503, "Requirement could not be deleted") from error
     return JSONResponse(content={"message": "Requirement deleted"})
+
+
+@router.post("/applications/{application_id}/recalculate")
+async def recalculate_application_requirements(
+    application_id: str,
+    payload: dict[str, Any],
+    database: AsyncDatabase = Depends(get_mongo_database),
+    principal: dict[str, str] = Depends(require_roles("ADMIN")),
+) -> JSONResponse:
+    reason = str(payload.get("reason") or "").strip()
+    if len(reason) < 5:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "A recalculation reason of at least 5 characters is required"},
+        )
+    try:
+        application = await database["visaapplications"].find_one(
+            id_query(application_id)
+        )
+        if not application:
+            return JSONResponse(status_code=404, content={"message": "Application not found"})
+        visa_type = await database["visatypes"].find_one(
+            id_query(str(application.get("visaTypeId") or ""))
+        )
+        if not visa_type:
+            return JSONResponse(status_code=404, content={"message": "Visa type not found"})
+        active = await database["visarequirements"].find(
+            {"visaTypeId": visa_type["_id"], "status": "ACTIVE"}
+        ).to_list(length=None)
+        total_error = _validate_configuration_total(active)
+        if total_error:
+            return JSONResponse(status_code=409, content={"message": total_error})
+        requirements = [_snapshot_item(item) for item in active]
+        requirements.sort(
+            key=lambda item: (
+                item.get("displayOrder", 0),
+                str(item.get("name") or ""),
+            )
+        )
+        documents = await database["documents"].find(
+            {"applicationId": str(application["_id"])}
+        ).to_list(length=None)
+    except PyMongoError as error:
+        logger.exception("Could not load application recalculation inputs")
+        raise APIError(503, "Application requirements could not be recalculated") from error
+
+    assessment = summarize_documents(requirements, documents)
+    now = datetime.now(timezone.utc)
+    previous_snapshot = (
+        application.get("requirementSnapshot")
+        or (application.get("evidencePolicySnapshot") or {}).get("requirements")
+        or []
+    )
+    previous_assessment = application.get("evidenceAssessment")
+    history_entry = {
+        "previousConfigurationVersion": application.get(
+            "requirementsConfigurationVersion"
+        ),
+        "previousRequirementSnapshot": previous_snapshot,
+        "previousAssessment": previous_assessment,
+        "configurationVersion": visa_type.get(
+            "requirementsConfigurationVersion", 0
+        ),
+        "requirementSnapshot": requirements,
+        "assessment": assessment,
+        "reason": reason,
+        "reviewedBy": principal["id"],
+        "createdAt": now,
+    }
+    changes = {
+        "requirementSnapshot": requirements,
+        "requirementsConfigurationVersion": visa_type.get(
+            "requirementsConfigurationVersion", 0
+        ),
+        "completenessScore": assessment["documentAssessmentScore"],
+        "documentReadiness": assessment["documentAssessmentScore"],
+        "documentAssessmentScore": assessment["documentAssessmentScore"],
+        "earnedPoints": assessment["earnedPoints"],
+        "maximumPoints": assessment["maximumPoints"],
+        "verificationPercentage": assessment["verificationPercentage"],
+        "submissionCompleteness": assessment["submissionCompleteness"],
+        "evidenceAssessment": assessment,
+        "assessmentStatus": assessment["documentProcessingStatus"],
+        "assessmentStale": False,
+        "verificationMetricsCurrent": assessment.get("processingDocuments", 0) == 0,
+        "scoringVersion": "document-requirements-v3",
+        "predictionStatus": "STALE",
+        "approvalProbability": None,
+        "approvalProbabilityNormalized": None,
+        "rejectionProbabilityNormalized": None,
+        "updatedAt": now,
+    }
+    query = {"_id": application["_id"]}
+    if application.get("updatedAt") is not None:
+        query["updatedAt"] = application["updatedAt"]
+    try:
+        saved = await database["visaapplications"].update_one(
+            query,
+            {
+                "$set": changes,
+                "$unset": {
+                    "evidencePolicySnapshot": "",
+                    "policyVersionId": "",
+                },
+                "$push": {
+                    "requirementRecalculationHistory": history_entry,
+                    "assessmentHistory": history_entry,
+                    "scoreHistory": {
+                        "maximumPoints": assessment["maximumPoints"],
+                        "earnedPoints": assessment["earnedPoints"],
+                        "documentAssessmentScore": assessment["documentAssessmentScore"],
+                        "requirementScores": assessment["requirementScores"],
+                        "configurationVersion": history_entry["configurationVersion"],
+                        "reason": reason,
+                        "reviewedBy": principal["id"],
+                        "calculatedAt": now,
+                    },
+                },
+            },
+        )
+        if not saved.matched_count:
+            return JSONResponse(
+                status_code=409,
+                content={"message": "Application changed while recalculating; reload and retry"},
+            )
+    except PyMongoError as error:
+        logger.exception("Could not save application requirements recalculation")
+        raise APIError(503, "Application recalculation could not be saved") from error
+    updated_application = {**application, **changes}
+    updated_application.pop("evidencePolicySnapshot", None)
+    updated_application.pop("policyVersionId", None)
+    updated_application["requirementRecalculationHistory"] = [
+        *(application.get("requirementRecalculationHistory") or []),
+        history_entry,
+    ]
+    updated_application["assessmentHistory"] = [
+        *(application.get("assessmentHistory") or []),
+        history_entry,
+    ]
+    updated_application["scoreHistory"] = [
+        *(application.get("scoreHistory") or []),
+        {
+            "maximumPoints": assessment["maximumPoints"],
+            "earnedPoints": assessment["earnedPoints"],
+            "documentAssessmentScore": assessment["documentAssessmentScore"],
+            "requirementScores": assessment["requirementScores"],
+            "configurationVersion": history_entry["configurationVersion"],
+            "reason": reason,
+            "reviewedBy": principal["id"],
+            "calculatedAt": now,
+        },
+    ]
+    return JSONResponse(
+        content={
+            "application": public_document(updated_application),
+            "assessment": public_document(assessment),
+            "configurationVersion": history_entry["configurationVersion"],
+        }
+    )

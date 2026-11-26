@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
-from ..core.config import settings
+from ..core.config import BANK_STATEMENT_MAX_FILE_SIZE, settings
 from .dependencies import get_current_principal
 
 logger = logging.getLogger(__name__)
@@ -20,9 +20,14 @@ async def _extract(file: UploadFile, requirement_code: str) -> JSONResponse:
     filename = Path(file.filename or "document").name
     if Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
         return JSONResponse(status_code=400, content={"message": "Only PDF, JPG, JPEG, and PNG files are supported"})
-    content = await file.read(settings.max_file_size + 1)
+    max_file_size = (
+        BANK_STATEMENT_MAX_FILE_SIZE
+        if requirement_code == "bank_statement"
+        else settings.max_file_size
+    )
+    content = await file.read(max_file_size + 1)
     await file.close()
-    if len(content) > settings.max_file_size:
+    if len(content) > max_file_size:
         return JSONResponse(status_code=413, content={"message": "Uploaded file exceeds the configured maximum size"})
     if not content:
         return JSONResponse(status_code=400, content={"message": "The uploaded file is empty"})

@@ -706,40 +706,6 @@ def evaluate_automated_document_verification(
                 )
 
     if document_type == "bank_statement":
-        account_holder = fields.get("accountHolderName")
-        applicant_name = applicant.get("fullName")
-        if _has_value(account_holder) and _has_value(applicant_name):
-            holder_tokens = name_tokens(account_holder)
-            applicant_tokens = name_tokens(applicant_name)
-            matches = holder_tokens == applicant_tokens
-            possible_match = (
-                not matches
-                and len(holder_tokens & applicant_tokens) >= 2
-                and min(len(holder_tokens), len(applicant_tokens))
-                == len(holder_tokens & applicant_tokens)
-            )
-            add_check(
-                "ACCOUNT_HOLDER_MATCH",
-                "Account holder match",
-                "PASSED" if matches else "INSUFFICIENT_DATA",
-                (
-                    "Account-holder name tokens match the applicant after case, spacing, punctuation, and ordering normalization."
-                    if matches
-                    else "Name formatting or token differences require human review; this is not a fraud determination."
-                    if possible_match
-                    else "The extracted account-holder name differs from the applicant profile and requires human review; this is not a fraud determination."
-                ),
-                fields_involved=("accountHolderName", "fullName"),
-            )
-        else:
-            add_check(
-                "ACCOUNT_HOLDER_MATCH",
-                "Account holder match",
-                "INSUFFICIENT_DATA",
-                "The account holder or submitted applicant name is unavailable.",
-                fields_involved=("accountHolderName", "fullName"),
-            )
-
         statement_start = _date(fields.get("statementStartDate"))
         statement_end = _date(fields.get("statementEndDate"))
         if statement_start and statement_end:
@@ -843,7 +809,21 @@ def evaluate_automated_document_verification(
                     "BANK_FINANCIAL_REQUIREMENT",
                     "Configured financial requirements",
                     "PASSED",
-                    "The available three-month balance evidence meets the configured threshold; authenticity is not established.",
+                    "The actual ending balance for the complete three-month period meets the configured minimum; monthly balances are supporting evidence only.",
+                )
+            elif financial_status == "BELOW_MINIMUM":
+                assessment = bank_statement_analysis.get("minimumBalanceAssessment") or {}
+                add_check(
+                    "BANK_FINANCIAL_REQUIREMENT",
+                    "Configured financial requirements",
+                    "NEEDS_REVIEW",
+                    (
+                        f"The period-end balance is {assessment.get('currency') or 'USD'} "
+                        f"{assessment.get('balance')}; the configured minimum is "
+                        f"{assessment.get('currency') or 'USD'} {assessment.get('minimum')}, "
+                        f"with a shortfall of {assessment.get('shortfall')}. Manual review is required."
+                    ),
+                    fields_involved=("closingBalance",),
                 )
             elif financial_status == "FAIL":
                 add_check(

@@ -26,6 +26,7 @@ def test_normalizes_aliases_amount_sign_currency_balance_page_and_evidence():
 
     transaction = result["transactions"][0]
     assert transaction == {
+        "transactionIndex": 0,
         "date": "2026-09-13",
         "description": "Card payment",
         "amount": 1234.5,
@@ -40,6 +41,9 @@ def test_normalizes_aliases_amount_sign_currency_balance_page_and_evidence():
         "runningBalance": 8765.5,
         "sourceText": "13/09/2026 Card payment (1,234.50) 8,765.50",
         "referenceNumber": None,
+        "sender": None,
+        "receiver": None,
+        "counterparty": None,
     }
     assert result["valid_count"] == 1
     assert result["invalid_transactions"] == []
@@ -205,7 +209,8 @@ def test_37_page_ocr_and_171_transactions_share_one_normalized_analysis_dataset(
     assert bank_analysis["statementPeriod"]["completeThreeMonths"] is True
     assert bank_analysis["financialRequirementStatus"] == "PASS"
     assert bank_analysis["reconciliation"]["status"] == "MATCHED"
-    assert bank_analysis["accountHolderCheck"]["status"] == "MATCHED"
+    assert bank_analysis["accountHolderCheck"]["status"] == "NOT_ASSESSED"
+    assert bank_analysis["accountHolderCheck"]["accountHolderName"] == "Dara Sok Lee"
     assert result["ocr_processing_summary"]["totalPages"] == 37
     assert bank_analysis["documentInformation"]["ocrPageCount"] == 37
 
@@ -246,7 +251,7 @@ def test_ocr_page_failure_keeps_rows_but_disables_final_scores():
     assert result["ocr_processing_summary"]["status"] == "OCR_PARTIAL"
 
 
-def test_name_ordering_and_middle_name_variation_are_non_adverse_review_outcomes():
+def test_account_holder_name_is_preserved_without_applicant_name_comparison():
     matched = analyze_bank_statement(
         _three_month_fields([]), applicant_name="Lee, Dara Sok"
     )
@@ -259,16 +264,16 @@ def test_name_ordering_and_middle_name_variation_are_non_adverse_review_outcomes
         applicant_name="Dara Sok Lee",
     )
 
-    assert matched["accountHolderCheck"]["status"] == "MATCHED"
-    assert possible["accountHolderCheck"]["status"] == "POSSIBLE_MATCH"
-    assert manual["accountHolderCheck"]["status"] == "NEEDS_MANUAL_REVIEW"
-    assert "not a fraud" in manual["accountHolderCheck"]["reason"].lower()
-
     accent_variant = analyze_bank_statement(
         _three_month_fields([], accountHolderName="Dára Sok Lee"),
         applicant_name="LEE, Dara Sok",
     )
-    assert accent_variant["accountHolderCheck"]["status"] == "MATCHED"
+    for result in (matched, possible, manual, accent_variant):
+        assert result["accountHolderCheck"]["status"] == "NOT_ASSESSED"
+        assert "not compared" in result["accountHolderCheck"]["reason"].lower()
+        assert "legal ownership of the account is not asserted" in result["accountHolderCheck"]["reason"].lower()
+    assert manual["accountHolderCheck"]["accountHolderName"] == "Other Person"
+    assert accent_variant["accountHolderCheck"]["accountHolderName"] == "Dára Sok Lee"
 
 
 def test_unexplained_large_deposits_are_flagged_and_income_requires_recurrence():
@@ -328,6 +333,7 @@ def test_reconciliation_mismatch_is_explicit_and_never_reported_as_matched():
         deposits="100",
         withdrawals="0",
     )
+    fields["monthlyClosingBalances"][-1]["closingBalance"] = "1200"
     result = analyze_bank_statement(fields)
 
     assert result["reconciliation"]["status"] == "MISMATCHED"

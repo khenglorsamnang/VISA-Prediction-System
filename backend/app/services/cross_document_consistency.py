@@ -15,8 +15,6 @@ _FIELD_ALIASES = {
         "full_name",
         "applicantName",
         "applicant_name",
-        "accountHolderName",
-        "account_holder_name",
         "name",
     ),
     "passportNumber": (
@@ -210,12 +208,16 @@ def document_consistency_checks(
         target_fields = context["fields"]
         compared_fields: set[str] = set()
         for canonical in _FIELD_ALIASES:
+            if kind == "bank_statement" and canonical == "fullName":
+                continue
             target_value = _value(target_fields, canonical)
             if target_value is None:
                 continue
             related_values = []
             for other in doc_context:
                 if other is context:
+                    continue
+                if canonical == "fullName" and other["kind"] == "bank_statement":
                     continue
                 other_value = _value(other["fields"], canonical)
                 if other_value is not None:

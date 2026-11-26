@@ -1,4 +1,8 @@
-from backend.app.services.document_metrics import bank_requirement_points, summarize_documents
+from backend.app.services.document_metrics import (
+    bank_requirement_points,
+    requirement_awarded_points,
+    summarize_documents,
+)
 from backend.app.services.automated_document_verification import evaluate_automated_document_verification
 
 
@@ -18,6 +22,8 @@ def doc(requirement_id, status="VERIFIED", points=None, file_id=None, **extra):
         "ocrStatus": "OCR_COMPLETED",
         "ocrTotalPages": 1,
         "ocrPagesProcessed": 1,
+        "ocrProgressPercent": 100,
+        "ocrPageNumbers": [1],
         "awardedPoints": points,
         **extra,
     }
@@ -59,11 +65,17 @@ def test_applicant_photo_does_not_require_ocr_text_fields():
 def test_bank_diagnostic_score_is_not_requirement_points_without_reliable_coverage():
     analysis = {
         "financialRequirementStatus": "INSUFFICIENT_DATA",
-        "bankStatementScore": {"available": True, "points": 1.24, "maximum": 50},
+        "bankStatementScore": {"available": True, "points": 1.24, "maximum": 45},
     }
-    assert bank_requirement_points(analysis, 60) == 0
+    assert bank_requirement_points(analysis, 60) is None
     analysis["financialRequirementStatus"] = "PASS"
-    assert bank_requirement_points(analysis, 60) == 1.49
+    assert bank_requirement_points(analysis, 60) == 1.65
+    analysis["financialRequirementStatus"] = "BELOW_MINIMUM"
+    assert bank_requirement_points(analysis, 60) == 1.65
+    analysis["financialRequirementStatus"] = "FAIL"
+    assert bank_requirement_points(analysis, 60) == 0
+    analysis.pop("financialRequirementStatus")
+    assert bank_requirement_points(analysis, 60) is None
 
 
 def test_passport_and_photo_scores_are_dynamic_percentages():
@@ -77,14 +89,14 @@ def test_partial_and_rejected_points_are_evidence_based():
         REQS,
         [doc("passport", points=5), doc("photo", points=5), doc("bank", status="PARTIAL", points=30), doc("id", status="REJECTED", points=5)],
     )
-    assert result["earnedPoints"] == 40
-    assert result["documentAssessmentScore"] == 53.33
+    assert result["earnedPoints"] == 10
+    assert result["documentAssessmentScore"] == 13.33
     assert next(item for item in result["requirementScores"] if item["requirementId"] == "id")["status"] == "REJECTED"
 
 
 def test_needs_review_and_insufficient_data_only_receive_confirmed_points():
     result = summarize_documents(REQS, [doc("passport", status="NEEDS_REVIEW", points=2), doc("photo", status="INSUFFICIENT_DATA", points=1)])
-    assert result["earnedPoints"] == 3
+    assert result["earnedPoints"] == 0
 
 
 def test_multiple_files_are_capped_and_single_file_uses_latest():
@@ -100,20 +112,20 @@ def test_multiple_files_are_capped_and_single_file_uses_latest():
     assert single["earnedPoints"] == 0
 
 
-def test_optional_denominator_policy_is_explicit():
+def test_optional_requirements_are_included_in_the_configured_maximum():
     requirements = [*REQS, {"requirementId": "optional", "name": "Optional", "required": False, "weight": 25}]
     excluded = summarize_documents(requirements, [])
     included = summarize_documents(requirements, [doc("optional", status="REJECTED", points=0)])
-    assert excluded["maximumPoints"] == 75
+    assert excluded["maximumPoints"] == 100
     assert included["maximumPoints"] == 100
 
 
-def test_optional_points_leave_denominator_when_last_file_is_deleted():
+def test_optional_maximum_is_stable_when_its_file_is_deleted():
     requirements = [*REQS, {"requirementId": "optional", "required": False, "weight": 25}]
     active = summarize_documents(requirements, [doc("optional", status="REJECTED", points=0)])
     deleted = summarize_documents(requirements, [{**doc("optional", status="DELETED", points=0)}])
     assert active["maximumPoints"] == 100
-    assert deleted["maximumPoints"] == 75
+    assert deleted["maximumPoints"] == 100
 
 
 def test_disabled_requirements_are_excluded_when_not_in_active_configuration():
@@ -127,3 +139,51 @@ def test_different_visa_requirement_sets_are_isolated_and_recalculation_is_idemp
     assert visa_a["documentAssessmentScore"] == 100
     assert visa_b["earnedPoints"] == 0
     assert summarize_documents([REQS[0]], [doc("passport", points=5)])["earnedPoints"] == visa_a["earnedPoints"]
+
+
+def test_requirement_points_are_dynamic_and_bank_contribution_uses_configured_maximum():
+    requirements = [
+        {"requirementId": "passport", "name": "Passport", "required": True, "weight": 15},
+        {"requirementId": "photo", "name": "Photo", "required": True, "weight": 15},
+        {"requirementId": "id", "name": "National ID Card", "required": True, "weight": 20},
+        {"requirementId": "bank", "code": "bank_statement", "name": "Bank Statement", "required": True, "weight": 50},
+    ]
+    documents = [
+        doc("passport"),
+        doc("photo"),
+        doc("id"),
+        doc(
+            "bank",
+            bankStatementAnalysis={
+                "financialRequirementStatus": "PASS",
+                "computedBankScore": {"available": True, "points": 30.04, "maximum": 45},
+            },
+        ),
+    ]
+    initial = summarize_documents(requirements, documents)
+    assert initial["maximumPoints"] == 100
+    assert initial["earnedPoints"] == 83.38
+    assert next(item for item in initial["requirementScores"] if item["requirementId"] == "bank")["earnedPoints"] == 33.38
+
+    changed = [
+        {**item, "weight": 60, "maximumEarnedPoints": 60}
+        if item["requirementId"] == "bank"
+        else item
+        for item in requirements
+    ]
+    updated = summarize_documents(changed, documents)
+    assert updated["maximumPoints"] == 110
+    assert next(item for item in updated["requirementScores"] if item["requirementId"] == "bank")["earnedPoints"] == 40.05
+
+    added = [*changed, {"requirementId": "new", "name": "Additional", "required": True, "weight": 10}]
+    assert summarize_documents(added, documents)["maximumPoints"] == 120
+
+    deactivated = [item for item in added if item["requirementId"] != "id"]
+    assert summarize_documents(deactivated, documents)["maximumPoints"] == 100
+
+
+def test_unverified_upload_never_earns_document_points():
+    requirement = {"requirementId": "passport", "name": "Passport", "required": True, "weight": 15}
+    uploaded = doc("passport", status="NEEDS_REVIEW", points=15)
+    assert requirement_awarded_points(requirement, uploaded) == 0
+    assert summarize_documents([requirement], [uploaded])["earnedPoints"] == 0

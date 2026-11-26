@@ -4,6 +4,7 @@ import json
 import asyncio
 import hashlib
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import PyMongoError
 
-from ..core.config import PROJECT_ROOT, settings
+from ..core.config import BANK_STATEMENT_MAX_FILE_SIZE, PROJECT_ROOT, settings
 from ..core.errors import APIError
 from ..services.business_rules import (
     DEFAULT_RULE_POLICY,
@@ -26,10 +27,13 @@ from ..services.business_rules import (
 from ..services.financial_analysis import calculate_financial_analysis
 from ..services.aba_integration import (analyze_aba_pdf, aba_to_legacy_ocr, apply_correction, reviewed_analysis, decrypted_render_bytes)
 from ..services.bank_statement_scoring import (
+    SOURCE_UNVERIFIED_PENALTY_POINTS,
+    _transaction_identity,
     analyze_bank_statement as score_bank_statement,
     calculate_document_verification_score,
     normalize_bank_fields,
 )
+from ..services.readiness_scoring import calculate_bank_score_assessment
 from .dependencies import get_mongo_database, require_roles
 from .mongo_helpers import id_query
 
@@ -37,6 +41,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _PRIVATE_DIR = PROJECT_ROOT / "backend" / "storage" / "private"
+_SOURCE_REVIEW_CATEGORIES = {
+    "SALARY": "Salary / ប្រាក់ខែ",
+    "BUSINESS_INCOME": "Business Income / ចំណូលអាជីវកម្ម",
+    "FAMILY_SUPPORT": "Family Support / គ្រួសារជួយ",
+    "PERSONAL_SAVINGS": "Personal Savings / ប្រាក់សន្សំ",
+    "OTHER": "Other / ផ្សេងៗ",
+    "UNKNOWN": "Unknown / មិនដឹងប្រភពច្បាស់លាស់",
+}
 _SIGNATURES = {
     ".pdf": b"%PDF-",
     ".jpg": b"\xff\xd8\xff",
@@ -153,6 +165,7 @@ def _build_result(
     applicant_context: dict[str, Any] | None = None,
     policy: dict[str, Any] | None = None,
     applicant_name: str = "",
+    document_id: str | None = None,
 ) -> dict[str, Any]:
     fields = normalize_bank_fields(ocr.get("fields"))
     transactions = fields.get("transactionHistory")
@@ -191,7 +204,9 @@ def _build_result(
     try:
         numeric_confidence = float(confidence)
     except (TypeError, ValueError):
-        numeric_confidence = 0.0
+        numeric_confidence = None
+    if numeric_confidence is not None and not math.isfinite(numeric_confidence):
+        numeric_confidence = None
     reported_confidence = None if metrics.get("source") == "ABA_NATIVE_LOCAL" else numeric_confidence
     warnings = list(ocr.get("warnings") or [])
     if ocr_incomplete:
@@ -210,7 +225,7 @@ def _build_result(
         )
     if metrics.get("source") == "ABA_NATIVE_LOCAL":
         warnings.append("No numeric OCR confidence was assigned to native/local ABA extraction; inspect its source and reconciliation checks.")
-    elif numeric_confidence < _LOW_CONFIDENCE_THRESHOLD:
+    elif numeric_confidence is not None and numeric_confidence < _LOW_CONFIDENCE_THRESHOLD:
         warnings.append("OCR confidence is low; verify extracted values against the original statement.")
 
     financial_assessment = {
@@ -218,7 +233,10 @@ def _build_result(
             "manual_review"
             if ocr_incomplete
             or verification["missing_fields"]
-            or numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+            or (
+                numeric_confidence is not None
+                and numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+            )
             else "extracted"
         ),
         "missing_fields": verification["missing_fields"],
@@ -262,6 +280,7 @@ def _build_result(
         financial_analysis,
         active_policy,
     )
+    bank_score_config = dict(active_policy["bank_statement_scoring"])
     bank_statement_analysis = score_bank_statement(
         fields,
         raw_text=str(ocr.get("extracted_text") or ""),
@@ -270,9 +289,10 @@ def _build_result(
             or (applicant_context or {}).get("fullName")
             or ""
         ),
-        config=active_policy["bank_statement_scoring"],
+        config=bank_score_config,
         financial_config=active_policy["financial_scoring"],
         ocr_complete=not ocr_incomplete,
+        document_id=document_id,
     )
     normalized_transactions = bank_statement_analysis.get("transactions", [])
     ocr_page_count = metrics.get("page_count") or len(ocr.get("pages") or [])
@@ -299,6 +319,17 @@ def _build_result(
             },
             "documentVerificationScore": verification,
         }
+    )
+    bank_statement_analysis.update(
+        calculate_bank_score_assessment(
+            {
+                "status": "NEEDS_REVIEW",
+                "extractedFields": fields,
+                "ocrConfidence": reported_confidence,
+            },
+            bank_statement_analysis,
+            applicant_context,
+        )
     )
     extracted["normalizedTransactions"] = normalized_transactions
     extracted["invalidTransactions"] = bank_statement_analysis.get("invalidTransactions", [])
@@ -446,11 +477,11 @@ async def analyze_bank_statement(
             content={"message": "Only PDF, JPG, JPEG, and PNG files are supported"},
         )
 
-    content = await file.read(settings.max_file_size + 1)
+    content = await file.read(BANK_STATEMENT_MAX_FILE_SIZE + 1)
     await file.close()
     if not content:
         return JSONResponse(status_code=400, content={"message": "The uploaded file is empty"})
-    if len(content) > settings.max_file_size:
+    if len(content) > BANK_STATEMENT_MAX_FILE_SIZE:
         return JSONResponse(status_code=413, content={"message": "Uploaded file exceeds the configured maximum size"})
     if not content.startswith(signature):
         return JSONResponse(status_code=400, content={"message": "File content does not match its extension"})
@@ -521,12 +552,26 @@ async def analyze_bank_statement(
         applicant_context,
         active_policy,
         applicant_name or applicant_name_camel,
+        document_id=statement_id,
     )
     if aba_analysis is not None:
         result["abaStatementAnalysis"] = aba_analysis
         result["human_review_required"] = True
-        # Legacy score/tolerance remains diagnostic; exact reader gates are authoritative.
-        result["warnings"].append("ABA evidence requires account-holder and staff review before application points are confirmed.")
+        result["bank_statement_analysis"].update(
+            calculate_bank_score_assessment(
+                {
+                    "status": "NEEDS_REVIEW",
+                    "extractedFields": result["extracted"],
+                    "ocrConfidence": result["score"].get("ocr_confidence"),
+                    "abaStatementAnalysis": aba_analysis,
+                },
+                result["bank_statement_analysis"],
+                applicant_context,
+            )
+        )
+        result["warnings"].append(
+            "ABA evidence requires staff review and independent reconciliation before points are confirmed."
+        )
     payload = {
         "applicant_name": applicant_name or applicant_name_camel,
         "visa_type": visa_type or visa_type_camel,
@@ -660,15 +705,20 @@ async def recalculate_bank_statement_score(
     fields = normalize_bank_fields(extracted)
     score = {
         **calculate_document_verification_score(fields),
-        "ocr_confidence": extracted.get("confidence", 0.0),
+        "ocr_confidence": extracted.get("confidence"),
     }
     try:
         numeric_confidence = float(score["ocr_confidence"])
     except (TypeError, ValueError):
-        numeric_confidence = 0.0
+        numeric_confidence = None
+    if numeric_confidence is not None and not math.isfinite(numeric_confidence):
+        numeric_confidence = None
     needs_review = (
         bool(score["missing_fields"])
-        or numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+        or (
+            numeric_confidence is not None
+            and numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+        )
     )
     update = {
         "score": score,
@@ -702,6 +752,20 @@ async def recalculate_bank_statement_score(
         applicant_name=str(statement.get("applicantName") or ""),
         config=policy["bank_statement_scoring"],
         financial_config=policy["financial_scoring"],
+        transaction_source_reviews=statement.get("transactionSourceReviews") or {},
+        document_id=statement_id,
+    )
+    bank_statement_analysis.update(
+        calculate_bank_score_assessment(
+            {
+                "status": "NEEDS_REVIEW",
+                "extractedFields": extracted,
+                "ocrConfidence": score["ocr_confidence"],
+                "abaStatementAnalysis": statement.get("abaStatementAnalysis"),
+            },
+            bank_statement_analysis,
+            statement.get("case_context") or {},
+        )
     )
     business_rules = evaluate_business_rules(
         statement.get("case_context") or {},
@@ -724,7 +788,10 @@ async def recalculate_bank_statement_score(
             },
             "result.human_review_required": (
                 bool(score["missing_fields"])
-                or numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+                or (
+                    numeric_confidence is not None
+                    and numeric_confidence < _LOW_CONFIDENCE_THRESHOLD
+                )
                 or financial_analysis["human_review_required"]
                 or business_rules["status"] == "manual_review"
                 or bank_statement_analysis["status"]
@@ -796,14 +863,67 @@ async def _aba_case_document(document_id: str, database: AsyncDatabase) -> tuple
         raise APIError(404, "Application not found")
     if not isinstance(document.get("abaStatementAnalysis"), dict):
         raise APIError(409, "Local ABA extraction is not available for this document")
+    requirement_rows = (
+        (application.get("evidencePolicySnapshot") or {}).get("requirements")
+        or application.get("requirementSnapshot")
+        or []
+    )
+    requirement = next(
+        (
+            item
+            for item in requirement_rows
+            if str(item.get("requirementId") or item.get("_id") or "")
+            == str(document.get("requirementId") or "")
+        ),
+        {},
+    )
+    configured_maximum = requirement.get(
+        "maximumEarnedPoints",
+        requirement.get("weight", requirement.get("points")),
+    )
+    if configured_maximum is not None:
+        document["requirementMaximumPoints"] = configured_maximum
     return document, application
 
 
 def _aba_response(document: dict[str, Any], application: dict[str, Any]) -> dict[str, Any]:
-    return {"analysis": document["abaStatementAnalysis"], "documentId": str(document["_id"]),
-            "status": document.get("status"), "selectedPrimary":
-                str(application.get("selectedBankDocumentId") or "") == str(document["_id"])
-                and application.get("selectedBankAnalysisRevision") == document["abaStatementAnalysis"].get("analysisRevision")}
+    analysis = document["abaStatementAnalysis"]
+    bank_statement_analysis = document.get("bankStatementAnalysis") or {}
+    bank_statement_analysis = {
+        **bank_statement_analysis,
+        **calculate_bank_score_assessment(document, bank_statement_analysis),
+    }
+    already_verified = (
+        document.get("staffReviewStatus") == "CONFIRMED"
+        or analysis.get("staffReviewStatus") == "CONFIRMED"
+        or document.get("status") == "VERIFIED"
+        or analysis.get("reviewStatus") == "VERIFIED"
+    )
+    verification_blockers = (
+        []
+        if already_verified
+        else _bank_statement_verification_blockers(
+            document, analysis, bank_statement_analysis
+        )
+    )
+    return {
+        "analysis": analysis,
+        "documentId": str(document["_id"]),
+        "bankStatementAnalysis": bank_statement_analysis,
+        "transactionSourceReviewAudit": document.get("transactionSourceReviewAudit") or [],
+        "verificationBlockers": verification_blockers,
+        "staffReviewStatus": document.get("staffReviewStatus") or analysis.get("staffReviewStatus"),
+        "documentReviewStatus": document.get("documentReviewStatus") or analysis.get("documentReviewStatus"),
+        "financialEvidenceStatus": analysis.get("financialEvidenceStatus"),
+        "confirmedBankScore": bank_statement_analysis.get("confirmedBankScore"),
+        "reviewerId": document.get("reviewerId"),
+        "reviewedAt": document.get("reviewedAt"),
+        "reviewNote": document.get("reviewNote"),
+        "manualReviewHistory": document.get("manualReviewHistory") or [],
+        "status": document.get("status"),
+        "selectedPrimary": str(application.get("selectedBankDocumentId") or "") == str(document["_id"])
+        and application.get("selectedBankAnalysisRevision") == analysis.get("analysisRevision"),
+    }
 
 
 async def _invalidate_aba_case(database: AsyncDatabase, application: dict[str, Any]) -> None:
@@ -817,17 +937,78 @@ async def _invalidate_aba_case(database: AsyncDatabase, application: dict[str, A
 
 
 async def _save_aba_document(database: AsyncDatabase, document: dict[str, Any], application: dict[str, Any],
-                             analysis: dict[str, Any], status: str) -> dict[str, Any]:
+                             analysis: dict[str, Any], status: str,
+                             review_event: dict[str, Any] | None = None) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     fields = aba_to_legacy_ocr(analysis)["fields"]
-    # Compatibility fields must follow the corrected source as well. Their old
-    # diagnostics are explicitly stale until recomputed; they never release ABA.
+    policy_record = await database["business_rules"].find_one(
+        {"_id": "visa_financial_rules"}
+    )
+    policy = validate_rule_policy(
+        policy_record.get("policy") if policy_record else DEFAULT_RULE_POLICY
+    )
+    owner_id = str(
+        application.get("customer")
+        or application.get("customerId")
+        or document.get("customerId")
+        or ""
+    )
+    applicant = (
+        await database["customers"].find_one(id_query(owner_id))
+        if owner_id
+        else None
+    ) or {}
+    score_config = dict(policy["bank_statement_scoring"])
+    bank_statement_analysis = score_bank_statement(
+        fields,
+        raw_text=str(document.get("ocrText") or ""),
+        applicant_name=str(applicant.get("fullName") or ""),
+        config=score_config,
+        financial_config=policy["financial_scoring"],
+        ocr_complete=str(document.get("ocrStatus") or "").upper()
+        == "OCR_COMPLETED",
+        transaction_source_reviews=document.get("transactionSourceReviews") or {},
+        document_id=str(document.get("_id") or ""),
+    )
+    bank_statement_analysis["sourceReviewAudit"] = (
+        document.get("transactionSourceReviewAudit") or []
+    )
+    score_document = {
+        **document,
+        "status": status,
+        "extractedFields": fields,
+        "abaStatementAnalysis": analysis,
+        "legacyBankDiagnosticsStale": False,
+    }
+    bank_statement_analysis.update(
+        calculate_bank_score_assessment(
+            score_document,
+            bank_statement_analysis,
+        )
+    )
+    # Compatibility fields are recalculated from the corrected local extraction.
+    update: dict[str, Any] = {
+        "$set": {"abaStatementAnalysis": analysis, "status": status, "workflowStatus": status,
+                 "extractedFields": fields, "legacyBankDiagnosticsStale": False,
+                 "bankStatementAnalysis": bank_statement_analysis,
+                 "awardedPoints": 0, "updatedAt": now},
+    }
+    if review_event:
+        update["$set"].update({
+            "staffReviewStatus": "CONFIRMED",
+            "documentReviewStatus": "CONFIRMED",
+            "financialEvidenceStatus": "VERIFIED",
+            "reviewedBy": review_event["reviewerId"],
+            "reviewerId": review_event["reviewerId"],
+            "reviewedAt": review_event["reviewedAt"],
+            "reviewReason": review_event["note"],
+            "reviewNote": review_event["note"],
+        })
+        update["$push"] = {"manualReviewHistory": review_event}
     updated = await database["documents"].update_one(
         {"_id": document["_id"], "abaStatementAnalysis.analysisRevision": document["abaStatementAnalysis"]["analysisRevision"],
          "status": {"$nin": ["DELETED", "REPLACED"]}},
-        {"$set": {"abaStatementAnalysis": analysis, "status": status, "workflowStatus": status,
-                  "extractedFields": fields, "legacyBankDiagnosticsStale": True,
-                  "awardedPoints": 0, "updatedAt": now}})
+        update)
     if not updated.matched_count:
         raise APIError(409, "Document or analysis changed; reload before reviewing")
     await _invalidate_aba_case(database, application)
@@ -835,7 +1016,14 @@ async def _save_aba_document(database: AsyncDatabase, document: dict[str, Any], 
 
     await _refresh_cross_document_consistency(database, str(application["_id"]))
     return {**document, "abaStatementAnalysis": analysis, "extractedFields": fields,
-            "legacyBankDiagnosticsStale": True, "status": status, "workflowStatus": status, "updatedAt": now}
+            "bankStatementAnalysis": bank_statement_analysis,
+            **({"staffReviewStatus": "CONFIRMED", "documentReviewStatus": "CONFIRMED",
+                "financialEvidenceStatus": "VERIFIED", "reviewedBy": review_event["reviewerId"],
+                "reviewerId": review_event["reviewerId"], "reviewedAt": review_event["reviewedAt"],
+                "reviewReason": review_event["note"], "reviewNote": review_event["note"],
+                "manualReviewHistory": [*(document.get("manualReviewHistory") or []), review_event]}
+               if review_event else {}),
+            "legacyBankDiagnosticsStale": False, "status": status, "workflowStatus": status, "updatedAt": now}
 
 
 @router.get("/documents/{document_id}/aba")
@@ -899,6 +1087,493 @@ async def review_document_aba(document_id: str, payload: dict[str, Any],
     return JSONResponse(content=_aba_response(updated, application), headers={"Cache-Control":"no-store"})
 
 
+def _bank_statement_verification_blockers(
+    document: dict[str, Any],
+    analysis: dict[str, Any],
+    bank_statement_analysis: dict[str, Any],
+) -> list[str]:
+    blockers: list[str] = []
+    if analysis.get("reconciliationStatus") != "RECONCILED":
+        blockers.append("Financial reconciliation must be RECONCILED.")
+    financial_status = str(
+        bank_statement_analysis.get("financialRequirementStatus") or ""
+    ).upper()
+    if financial_status not in {"PASS", "BELOW_MINIMUM"}:
+        status = financial_status or "NOT_AVAILABLE"
+        blockers.append(f"Required financial evidence checks must pass (current status: {status}).")
+
+    score = bank_statement_analysis.get("bankStatementScore") or {}
+    expected_weights = {
+        "ending_balance": 22.5,
+        "starting_balance": 6.75,
+        "transaction_history": 9.0,
+        "transaction_period": 6.75,
+    }
+    components = score.get("components") or {}
+    missing_categories = [
+        key.replace("_", " ").title()
+        for key, maximum in expected_weights.items()
+        if not isinstance(components.get(key), dict)
+        or components[key].get("available") is not True
+        or components[key].get("points") is None
+        or components[key].get("maximum") != maximum
+    ]
+    if missing_categories or score.get("available") is not True or score.get("provisional"):
+        categories = ", ".join(missing_categories) or "the complete 45-point score"
+        blockers.append(f"Required financial score checks are incomplete: {categories}.")
+
+    required_fields = calculate_document_verification_score(
+        document.get("extractedFields") or {}
+    )["missing_fields"]
+    if required_fields:
+        blockers.append(
+            "Required document review checklist items are incomplete: "
+            + ", ".join(required_fields)
+            + "."
+        )
+
+    review_blockers = analysis.get("reviewBlockers") or []
+    if review_blockers:
+        messages = [
+            str(item.get("message") or "A required extraction or financial review remains unresolved.")
+            for item in review_blockers
+            if isinstance(item, dict)
+        ]
+        if messages:
+            blockers.append("Unresolved statement review items: " + " ".join(messages))
+
+    saved_source_reviews = document.get("transactionSourceReviews")
+    if not isinstance(saved_source_reviews, dict):
+        saved_source_reviews = {}
+    transaction_reviews = [
+        item
+        for item in score.get("transactionReviews") or []
+        if isinstance(item, dict) and item.get("requiresStaffReview") is True
+    ]
+    pending = []
+    invalid_resolutions = []
+    status_aliases = {
+        "SOURCE_CONFIRMED": "CONFIRMED",
+        "SOURCE_UNVERIFIED": "UNVERIFIED",
+    }
+    for item in transaction_reviews:
+        index = str(item.get("transactionIndex"))
+        saved_review = saved_source_reviews.get(index)
+        review_status = status_aliases.get(
+            str(item.get("status") or "PENDING_REVIEW").upper(),
+            str(item.get("status") or "PENDING_REVIEW").upper(),
+        )
+        saved_status = (
+            status_aliases.get(
+                str(saved_review.get("status") or "PENDING_REVIEW").upper(),
+                str(saved_review.get("status") or "PENDING_REVIEW").upper(),
+            )
+            if isinstance(saved_review, dict)
+            else "PENDING_REVIEW"
+        )
+        if review_status not in {"CONFIRMED", "UNVERIFIED"} or saved_status != review_status:
+            pending.append(item)
+            continue
+        if (
+            not isinstance(saved_review, dict)
+            or not saved_review.get("reviewerId")
+            or not saved_review.get("reviewedAt")
+            or saved_review.get("sourceCategory") not in _SOURCE_REVIEW_CATEGORIES
+            or item.get("reviewerId") != saved_review.get("reviewerId")
+            or item.get("reviewedAt") != saved_review.get("reviewedAt")
+            or item.get("sourceCategory") != saved_review.get("sourceCategory")
+        ):
+            invalid_resolutions.append(item)
+    if pending:
+        indexes = ", ".join(
+            str(item.get("transactionIndex")) for item in pending
+        )
+        blockers.append(
+            f"Source review is unresolved for transaction(s): {indexes}. "
+            "Confirm the source or explicitly mark it unverified."
+        )
+    if invalid_resolutions:
+        indexes = ", ".join(
+            str(item.get("transactionIndex")) for item in invalid_resolutions
+        )
+        blockers.append(
+            f"Source-review decision audit is incomplete for transaction(s): {indexes}."
+        )
+    return blockers
+
+
+@router.post("/documents/{document_id}/aba/verify")
+async def verify_document_aba(
+    document_id: str,
+    payload: dict[str, Any],
+    database: AsyncDatabase = Depends(get_mongo_database),
+    principal: dict[str, str] = Depends(require_roles("ADMIN", "STAFF")),
+) -> JSONResponse:
+    document, application = await _aba_case_document(document_id, database)
+    analysis = document["abaStatementAnalysis"]
+    if (
+        document.get("staffReviewStatus") == "CONFIRMED"
+        or analysis.get("staffReviewStatus") == "CONFIRMED"
+        or document.get("status") == "VERIFIED"
+        or analysis.get("reviewStatus") == "VERIFIED"
+    ):
+        raise APIError(409, "Bank statement has already been verified")
+    if payload.get("analysisRevision") != analysis.get("analysisRevision"):
+        raise APIError(409, "Analysis changed. Reload before verification.")
+    reason = str(payload.get("reason") or "").strip()
+    if len(reason) < 8:
+        raise APIError(400, "A review note of at least 8 characters is required.")
+
+    blockers = _bank_statement_verification_blockers(
+        document, analysis, document.get("bankStatementAnalysis") or {}
+    )
+    if blockers:
+        raise APIError(409, "Verification blocked: " + " ".join(blockers))
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        verified_analysis = reviewed_analysis(
+            analysis,
+            {
+                "analysisRevision": analysis["analysisRevision"],
+                "status": "VERIFIED",
+                "reason": reason,
+            },
+            principal["id"],
+        )
+    except (ValueError, ArithmeticError) as error:
+        raise APIError(409, str(error)) from error
+    verified_analysis.update({
+        "staffReviewStatus": "CONFIRMED",
+        "documentReviewStatus": "CONFIRMED",
+        "financialEvidenceStatus": "VERIFIED",
+        "authenticityStatus": analysis.get("authenticityStatus") or "NOT_VERIFIED",
+    })
+    review_event = {
+        "status": "CONFIRMED",
+        "reviewerId": principal["id"],
+        "actorRole": principal["role"],
+        "reviewedAt": now,
+        "note": reason,
+        "previousStatus": str(document.get("status") or "NEEDS_REVIEW").upper(),
+    }
+    updated = await _save_aba_document(
+        database, document, application, verified_analysis, "VERIFIED", review_event
+    )
+    return JSONResponse(
+        content=_aba_response(updated, application),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/documents/{document_id}/transactions/{transaction_index}/source-review")
+async def review_bank_transaction_source(
+    document_id: str,
+    transaction_index: int,
+    payload: dict[str, Any],
+    database: AsyncDatabase = Depends(get_mongo_database),
+    principal: dict[str, str] = Depends(require_roles("ADMIN", "STAFF")),
+) -> JSONResponse:
+    if transaction_index < 0:
+        raise APIError(400, "Transaction index must be non-negative")
+    document = await database["documents"].find_one(id_query(document_id))
+    if (
+        not document
+        or document.get("status") in {"DELETED", "REPLACED"}
+        or not (
+            str(document.get("requirementCode") or "").casefold() == "bank_statement"
+            or isinstance(document.get("abaStatementAnalysis"), dict)
+        )
+    ):
+        raise APIError(404, "Current bank statement not found")
+    analysis = document.get("bankStatementAnalysis")
+    if not isinstance(analysis, dict):
+        raise APIError(409, "Bank statement scoring is not available for this document")
+    action = str(payload.get("action") or "").strip().upper()
+    status_by_action = {
+        "CONFIRM_SOURCE": "CONFIRMED",
+        "SOURCE_UNVERIFIED": "UNVERIFIED",
+        "REQUEST_MORE_EVIDENCE": "PENDING_REVIEW",
+    }
+    if action not in status_by_action:
+        raise APIError(400, "Unsupported transaction source-review action")
+    evidence_references = payload.get("evidenceReferences") or []
+    if isinstance(evidence_references, str):
+        evidence_references = [evidence_references]
+    if (
+        not isinstance(evidence_references, list)
+        or any(not isinstance(item, str) or not item.strip() for item in evidence_references)
+    ):
+        raise APIError(400, "Evidence references must be a list of non-empty strings")
+    evidence_references = list(dict.fromkeys(item.strip()[:500] for item in evidence_references))
+    notes = str(payload.get("notes") or "").strip()
+    source_category = str(payload.get("sourceCategory") or "").strip().upper()
+    if source_category and source_category not in _SOURCE_REVIEW_CATEGORIES:
+        raise APIError(400, "Choose a valid source category")
+    if not source_category:
+        raise APIError(400, "A source category is required for every review decision")
+    if action == "CONFIRM_SOURCE" and source_category == "UNKNOWN":
+        raise APIError(400, "Unknown source cannot be confirmed; mark it unverified after review")
+    if source_category == "OTHER" and not notes:
+        raise APIError(400, "A Staff Review Note is required when the source category is Other")
+    policy_record = await database["business_rules"].find_one(
+        {"_id": "visa_financial_rules"}
+    )
+    policy = validate_rule_policy(
+        policy_record.get("policy") if policy_record else DEFAULT_RULE_POLICY
+    )
+    bank_policy = policy["bank_statement_scoring"]
+    application = await database["visaapplications"].find_one(
+        id_query(str(document.get("applicationId") or ""))
+    )
+    applicant_id = str(
+        (application or {}).get("customer")
+        or (application or {}).get("customerId")
+        or document.get("customerId")
+        or ""
+    )
+    applicant = (
+        await database["customers"].find_one(id_query(applicant_id))
+        if applicant_id
+        else None
+    ) or {}
+    score_config = dict(bank_policy)
+    fields = document.get("extractedFields") or {}
+    source_reviews = dict(document.get("transactionSourceReviews") or {})
+    current_scoring = score_bank_statement(
+        fields,
+        raw_text=str(document.get("ocrText") or ""),
+        config=score_config,
+        financial_config=policy["financial_scoring"],
+        applicant_name=str(applicant.get("fullName") or ""),
+        ocr_complete=str(document.get("ocrStatus") or "").upper() == "OCR_COMPLETED",
+        transaction_source_reviews=source_reviews,
+        document_id=str(document.get("_id") or ""),
+    )
+    transaction_review = next(
+        (
+            item
+            for item in (current_scoring.get("bankStatementScore") or {}).get(
+                "transactionReviews", []
+            )
+            if item.get("transactionIndex") == transaction_index
+        ),
+        None,
+    )
+    if transaction_review is None:
+        raise APIError(404, "Transaction does not meet the configured staff-review threshold")
+    requested_evidence = str(payload.get("requestedEvidence") or "").strip()
+    if action == "REQUEST_MORE_EVIDENCE" and not requested_evidence:
+        raise APIError(400, "Describe the supporting evidence requested")
+
+    now = datetime.now(timezone.utc).isoformat()
+    status = status_by_action[action]
+    penalty_points = (
+        SOURCE_UNVERIFIED_PENALTY_POINTS if status == "UNVERIFIED" else 0.0
+    )
+    existing_review = source_reviews.get(str(transaction_index)) or {}
+    if not evidence_references:
+        evidence_references = list(
+            transaction_review.get("evidenceReferences")
+            or existing_review.get("evidenceReferences")
+            or []
+        )
+    transaction_source_evidence = transaction_review.get("sourceEvidence")
+    previous_history = list(existing_review.get("decisionHistory") or [])
+    if not previous_history:
+        previous_history = [
+            event
+            for event in document.get("transactionSourceReviewAudit") or []
+            if event.get("transactionIndex") == transaction_index
+        ]
+    if not previous_history and existing_review.get("reviewerId"):
+        previous_history = [
+            {
+                "status": existing_review.get("status"),
+                "sourceCategory": existing_review.get("sourceCategory"),
+                "sourceCategoryLabel": existing_review.get("sourceCategoryLabel"),
+                "reviewerId": existing_review.get("reviewerId"),
+                "reviewedAt": existing_review.get("reviewedAt"),
+                "notes": existing_review.get("notes"),
+                "evidenceReferences": existing_review.get("evidenceReferences", []),
+            }
+        ]
+    audit_event = {
+        "transactionIndex": transaction_index,
+        "transactionAmount": transaction_review["amount"],
+        "transactionCurrency": transaction_review["currency"],
+        "amountUsd": transaction_review["amountUsd"],
+        "exchangeRateToUsd": transaction_review["exchangeRateToUsd"],
+        "staffReviewThresholdUsd": transaction_review["staffReviewThresholdUsd"],
+        "transactionReference": transaction_review.get("reference"),
+        "transactionSourceEvidence": transaction_source_evidence,
+        "action": action,
+        "status": status,
+        "sourceCategory": source_category or None,
+        "sourceCategoryLabel": _SOURCE_REVIEW_CATEGORIES.get(source_category),
+        "reviewerId": principal["id"],
+        "reviewedAt": now,
+        "evidenceReferences": evidence_references,
+        "notes": notes,
+        "requestedEvidence": requested_evidence if status == "PENDING_REVIEW" else None,
+        "penaltyPoints": penalty_points,
+        "penaltyReason": notes if status == "UNVERIFIED" else None,
+    }
+    review = {
+        "status": status,
+        "transactionIdentity": _transaction_identity(
+            (current_scoring.get("transactions") or [])[transaction_index]
+        ),
+        "transactionAmount": transaction_review["amount"],
+        "transactionCurrency": transaction_review["currency"],
+        "amountUsd": transaction_review["amountUsd"],
+        "exchangeRateToUsd": transaction_review["exchangeRateToUsd"],
+        "staffReviewThresholdUsd": transaction_review["staffReviewThresholdUsd"],
+        "transactionReference": transaction_review.get("reference"),
+        "transactionSourceEvidence": transaction_source_evidence,
+        "sourceCategory": source_category or None,
+        "sourceCategoryLabel": _SOURCE_REVIEW_CATEGORIES.get(source_category),
+        "reviewerId": principal["id"],
+        "reviewedAt": now,
+        "evidenceReferences": evidence_references,
+        "notes": notes,
+        "decisionHistory": [*previous_history, audit_event],
+        "requestedEvidence": requested_evidence if status == "PENDING_REVIEW" else None,
+        "penaltyPoints": penalty_points,
+        "penaltyReason": notes if status == "UNVERIFIED" else None,
+    }
+    source_reviews[str(transaction_index)] = review
+    rescored = score_bank_statement(
+        fields,
+        raw_text=str(document.get("ocrText") or ""),
+        config=score_config,
+        financial_config=policy["financial_scoring"],
+        applicant_name=str(applicant.get("fullName") or ""),
+        ocr_complete=str(document.get("ocrStatus") or "").upper() == "OCR_COMPLETED",
+        transaction_source_reviews=source_reviews,
+        document_id=str(document.get("_id") or ""),
+    )
+    rescored.update(
+        calculate_bank_score_assessment(
+            {**document, "bankStatementAnalysis": rescored},
+            rescored,
+        )
+    )
+    bank_score = rescored.get("bankStatementScore") or {}
+    pending_transaction_reviews = int(
+        bank_score.get("pendingTransactionReviews") or 0
+    )
+    transaction_reviews = [
+        item
+        for item in bank_score.get("transactionReviews") or []
+        if isinstance(item, dict)
+    ]
+    all_transaction_reviews_complete = bool(transaction_reviews) and pending_transaction_reviews == 0
+    completed_review_timestamp = (
+        max(
+            (
+                str(item.get("reviewedAt") or "")
+                for item in transaction_reviews
+                if item.get("status") in {"CONFIRMED", "UNVERIFIED"}
+                and item.get("reviewedAt")
+            ),
+            default=now,
+        )
+        if all_transaction_reviews_complete
+        else None
+    )
+    completed_review_fields = (
+        {
+            "status": "VERIFIED",
+            "workflowStatus": "VERIFIED",
+            "staffReviewStatus": "VERIFIED",
+            "documentReviewStatus": "VERIFIED",
+            "financialEvidenceStatus": "VERIFIED",
+            "reviewedAt": completed_review_timestamp,
+        }
+        if all_transaction_reviews_complete
+        else {
+            "status": "NEEDS_REVIEW",
+            "workflowStatus": "NEEDS_REVIEW",
+            "staffReviewStatus": "PENDING_REVIEW",
+            "documentReviewStatus": "PENDING_REVIEW",
+        }
+    )
+    revision = int(document.get("transactionSourceReviewRevision") or 0)
+    rescored["sourceReviewAudit"] = [
+        *(document.get("transactionSourceReviewAudit") or []),
+        audit_event,
+    ]
+    updated = await database["documents"].update_one(
+        {
+            "_id": document["_id"],
+            "transactionSourceReviewRevision": revision,
+        },
+        {
+            "$set": {
+                "transactionSourceReviews": source_reviews,
+                "transactionSourceReviewRevision": revision + 1,
+                "bankStatementAnalysis": rescored,
+                "updatedAt": datetime.now(timezone.utc),
+                **completed_review_fields,
+                "abaStatementAnalysis.staffReviewStatus": completed_review_fields["staffReviewStatus"],
+                "abaStatementAnalysis.documentReviewStatus": completed_review_fields["documentReviewStatus"],
+                "abaStatementAnalysis.financialEvidenceStatus": (
+                    completed_review_fields.get("financialEvidenceStatus")
+                    or "NEEDS_REVIEW"
+                ),
+                "abaStatementAnalysis.reviewedAt": completed_review_timestamp,
+            },
+            "$push": {"transactionSourceReviewAudit": audit_event},
+        },
+    )
+    if not updated.matched_count and revision == 0:
+        updated = await database["documents"].update_one(
+            {
+                "_id": document["_id"],
+                "transactionSourceReviewRevision": {"$exists": False},
+            },
+            {
+                "$set": {
+                    "transactionSourceReviews": source_reviews,
+                    "transactionSourceReviewRevision": 1,
+                    "bankStatementAnalysis": rescored,
+                    "updatedAt": datetime.now(timezone.utc),
+                    **completed_review_fields,
+                    "abaStatementAnalysis.staffReviewStatus": completed_review_fields["staffReviewStatus"],
+                    "abaStatementAnalysis.documentReviewStatus": completed_review_fields["documentReviewStatus"],
+                    "abaStatementAnalysis.financialEvidenceStatus": (
+                        completed_review_fields.get("financialEvidenceStatus")
+                        or "NEEDS_REVIEW"
+                    ),
+                    "abaStatementAnalysis.reviewedAt": completed_review_timestamp,
+                },
+                "$push": {"transactionSourceReviewAudit": audit_event},
+            },
+        )
+    if not updated.matched_count:
+        raise APIError(409, "Transaction review changed; reload before saving")
+    if application:
+        await _invalidate_aba_case(database, application)
+    account_number = _account_number_from(document)
+    public_analysis = _public_analysis(
+        rescored,
+        {account_number} if account_number else set(),
+    )
+    return JSONResponse(
+        content={
+            "bankStatementAnalysis": public_analysis,
+            "audit": audit_event,
+            "auditHistory": [
+                *(document.get("transactionSourceReviewAudit") or []),
+                audit_event,
+            ],
+            "transactionSourceReviewRevision": revision + 1,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.post("/documents/{document_id}/aba/select-primary")
 async def select_primary_document_aba(document_id: str, payload: dict[str, Any],
                                        database: AsyncDatabase = Depends(get_mongo_database),
@@ -910,8 +1585,8 @@ async def select_primary_document_aba(document_id: str, payload: dict[str, Any],
     reason = str(payload.get("reason") or "").strip()
     if len(reason) < 8:
         raise APIError(400, "A selection reason of at least 8 characters is required")
-    if document.get("status") != "VERIFIED" or analysis.get("reviewStatus") != "VERIFIED" or not analysis.get("ownerRelationshipConfirmed") or analysis.get("reconciliationStatus") != "RECONCILED":
-        raise APIError(409, "Verify the exact bank evidence and account relationship before selecting it")
+    if document.get("status") != "VERIFIED" or analysis.get("reviewStatus") != "VERIFIED" or analysis.get("reconciliationStatus") != "RECONCILED":
+        raise APIError(409, "Verify the exact bank evidence and reconciliation before selecting it")
     event = {"documentId": document_id, "analysisRevision": analysis["analysisRevision"], "reason": reason,
              "actorId": principal["id"], "at": datetime.now(timezone.utc).isoformat()}
     await database["visaapplications"].update_one({"_id": application["_id"]},

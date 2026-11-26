@@ -141,29 +141,13 @@ async def run_verification(
         )
         if principal["role"] == "CUSTOMER" and owner_id != principal["id"]:
             return JSONResponse(status_code=404, content={"message": "Application not found"})
-        snapshots = application.get("requirementSnapshot") or []
-        # The live, enabled policy is authoritative for current scoring. The
-        # application snapshot remains available for historical audit/reporting.
         live_requirements = await database["visarequirements"].find(
             {"visaTypeId": application.get("visaTypeId"), "status": "ACTIVE"}
         ).to_list(length=None)
-        if live_requirements and not policy_snapshot(application):
-            snapshots = [
-                {
-                    "requirementId": str(item["_id"]),
-                    "name": item.get("name"),
-                    "code": item.get("code"),
-                    "required": item.get("required", True),
-                    "conditional": item.get("conditional", False),
-                    "weight": item.get("weight", 0),
-                    "displayOrder": item.get("displayOrder", 0),
-                    "acceptedFormats": item.get("acceptedFormats", []),
-                    "allowMultiple": item.get("allowMultiple", False),
-                    "policyVersion": item.get("updatedAt") or item.get("createdAt"),
-                }
-                for item in live_requirements
-            ]
-        snapshots = application_requirements(application, snapshots)
+        snapshots = application_requirements(
+            application,
+            live_requirements or application.get("requirementSnapshot") or [],
+        )
         documents = await database["documents"].find(
             {
                 "applicationId": str(application["_id"]),
@@ -391,18 +375,31 @@ async def run_verification(
                 item["analysis"]["financialRequirementStatus"] == "FAIL"
                 for item in bank_statements
             )
-            incomplete_analysis = any(
-                item["analysis"]["financialRequirementStatus"]
-                != "PASS"
+            below_minimum_analysis = any(
+                item["analysis"]["financialRequirementStatus"] == "BELOW_MINIMUM"
                 for item in bank_statements
             )
-            explanation += (
-                " Automated bank-statement checks found insufficient evidence."
-                if incomplete_analysis
-                else " Three-month USD balance checks passed; authenticity is not confirmed."
+            incomplete_analysis = any(
+                item["analysis"]["financialRequirementStatus"]
+                not in {"PASS", "BELOW_MINIMUM"}
+                for item in bank_statements
             )
+            if incomplete_analysis:
+                explanation += " Automated bank-statement checks found insufficient evidence."
+            elif below_minimum_analysis:
+                result_status = "NEEDS_REVIEW"
+                explanation += (
+                    " The complete-period ending balance is below the configured minimum; "
+                    "this is a warning requiring manual review, not an automatic failure."
+                )
+            else:
+                explanation += (
+                    " The complete-period ending balance meets the configured minimum; "
+                    "authenticity is not confirmed."
+                )
         else:
             failed_analysis = False
+            below_minimum_analysis = False
             incomplete_analysis = False
             if is_bank_statement_requirement:
                 result_status = "INSUFFICIENT_DATA"
@@ -428,6 +425,8 @@ async def run_verification(
                     if failed_analysis
                     else "INSUFFICIENT_DATA"
                     if incomplete_analysis
+                    else "BELOW_MINIMUM"
+                    if below_minimum_analysis
                     else "PASS"
                     if bank_statements
                     else None
@@ -511,6 +510,12 @@ async def run_verification(
             if any(
                 item.get("bankFinancialRequirementStatus")
                 == "INSUFFICIENT_DATA"
+                for item in checks
+            )
+            else "BELOW_MINIMUM"
+            if any(
+                item.get("bankFinancialRequirementStatus")
+                == "BELOW_MINIMUM"
                 for item in checks
             )
             else "PASS"

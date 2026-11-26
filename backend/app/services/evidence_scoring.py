@@ -55,10 +55,8 @@ def normalize_scoring_fields(requirement: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(requirement)
     maximum = number(result.get("maximumEarnedPoints", result.get("weight", 0)), name="Maximum points")
     minimum = number(result.get("minimumEarnedPoints", 0), name="Minimum points")
-    if not D(0) <= minimum <= maximum <= D(100):
-        raise ValueError("Points must satisfy 0 <= minimum <= maximum <= 100")
-    if maximum.as_tuple().exponent < -2 or minimum.as_tuple().exponent < -2:
-        raise ValueError("Configured point allocations support at most two decimal places")
+    if not D(0) <= minimum <= maximum or maximum > D(100):
+        raise ValueError("Points must be between 0 and 100.")
     if "weight" in result and "maximumEarnedPoints" in result and number(result["weight"]) != maximum:
         raise ValueError("weight is an alias of maximumEarnedPoints and cannot differ")
     mode = str(result.get("scoringMode", "FIXED")).upper()
@@ -102,12 +100,24 @@ def validate_profile_requirements(requirements: Any) -> list[dict[str, Any]]:
     if len(normalized) != len(requirements):
         raise ValueError("Requirements must be objects")
     seen = set()
+    seen_names = set()
+    seen_codes = set()
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in normalized:
         identity = requirement_id(r)
         if not identity or identity in seen:
             raise ValueError("Every requirement needs a unique requirementId or code")
         seen.add(identity)
+        name = str(r.get("name") or "").strip().casefold()
+        code = str(r.get("code") or "").strip().casefold()
+        if name and name in seen_names:
+            raise ValueError("Requirement names must be unique")
+        if code and code in seen_codes:
+            raise ValueError("Requirement codes must be unique")
+        if name:
+            seen_names.add(name)
+        if code:
+            seen_codes.add(code)
         r["requirementId"] = identity
         groups[str(r.get("alternativeGroupId") or identity)].append(r)
         if r["scoringMode"] == "DYNAMIC":
@@ -161,8 +171,8 @@ def validate_profile_requirements(requirements: Any) -> list[dict[str, Any]]:
             raise ValueError("Conditional requirements need a budget-preserving alternative group/profile variant")
         # A stable slot stays in the denominator even when a branch lacks evidence.
         maximum += next(iter(budgets))
-    if maximum != D(100):
-        raise ValueError(f"Published profile must allocate exactly 100 points; allocated {maximum}")
+    if maximum <= 0 or not maximum.is_finite():
+        raise ValueError("The total maximum points must be greater than zero and finite")
     return normalized
 
 
@@ -221,8 +231,6 @@ def _quality(requirement: dict[str, Any], document: dict[str, Any], as_of: date)
         reasons.append("Statement review must be verified")
     if str(analysis.get("modelVersion")) != str(requirement.get("qualityScorerVersion", "1.0")):
         reasons.append("Statement scorer version differs from this policy's version")
-    if not analysis.get("ownerRelationshipConfirmed"):
-        reasons.append("Statement ownership/sponsor relationship needs confirmation")
     if analysis.get("acceptedForPolicy") is False:
         reasons.append("Statement does not meet the selected policy's evidence rules")
     if (analysis.get("score") or {}).get("provisional") or analysis.get("provisional"):
@@ -248,7 +256,7 @@ def _quality(requirement: dict[str, Any], document: dict[str, Any], as_of: date)
 
 
 def calculate_evidence_assessment(requirements: list[dict[str, Any]], documents: list[dict[str, Any]], *, policy: dict[str, Any] | None = None, application: dict[str, Any] | None = None, as_of: datetime | date | None = None) -> dict[str, Any]:
-    """Return confirmed evidence points with an upload-independent 100-point budget."""
+    """Return confirmed evidence points against the configured requirement budget."""
     policy, application = policy or {}, application or {}
     calculated = as_of or datetime.now(timezone.utc)
     if isinstance(calculated, datetime):
@@ -259,12 +267,16 @@ def calculate_evidence_assessment(requirements: list[dict[str, Any]], documents:
     try:
         requirements = validate_profile_requirements(requirements)
     except ValueError as exc:
-        return {"scoringVersion":VERSION,"status":"NEEDS_REVIEW","complete":False,"gates":[str(exc)],"confirmedReadinessPoints":0.0,"confirmedReadinessNormalized":0.0,"documentAssessmentScore":0.0,"documentReadiness":0.0,"earnedPoints":0.0,"maximumPoints":100.0,"requirementScores":[],"approvalProbability":None,"configurationValid":False}
+        return {"scoringVersion":VERSION,"status":"NEEDS_REVIEW","complete":False,"gates":[str(exc)],"confirmedReadinessPoints":0.0,"confirmedReadinessNormalized":0.0,"documentAssessmentScore":0.0,"documentReadiness":0.0,"earnedPoints":0.0,"maximumPoints":0.0,"requirementScores":[],"approvalProbability":None,"configurationValid":False}
     current = [d for d in documents if str(d.get("status", "")).upper() not in INACTIVE]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in requirements:
         grouped[str(r.get("alternativeGroupId") or r["requirementId"])].append(r)
     total = D(0)
+    total_maximum = sum(
+        (number(members[0]["maximumEarnedPoints"]) for members in grouped.values()),
+        D(0),
+    )
     upper = D(0)
     slots = []
     gates = []
@@ -357,6 +369,7 @@ def calculate_evidence_assessment(requirements: list[dict[str, Any]], documents:
     failed = sum(s == "FAILED" for s in statuses)
     status = "PROCESSING" if processing else "NEEDS_REVIEW" if gates else "READY_FOR_STAFF_REVIEW"
     score_value = displayed(total)
+    score_percentage = displayed(D(100) * total / total_maximum) if total_maximum else 0.0
     pages = sum(int(d.get("ocrTotalPages") or 0) for d in current)
     processed = sum(int(d.get("ocrPagesProcessed") or 0) for d in current)
-    return {"scoringVersion":VERSION,"policyVersionId":str(policy.get("id") or policy.get("_id") or ""),"policyVersion":policy.get("version"),"configurationValid":True,"status":status,"complete":not gates and not processing,"gates":gates,"confirmedReadinessPoints":score_value,"confirmedReadinessNormalized":float(total/D(100)),"exactPoints":str(total),"documentAssessmentScore":score_value,"documentReadiness":score_value,"earnedPoints":score_value,"verifiedPoints":score_value,"maximumPoints":100.0,"totalAvailablePoints":100.0,"requirementScores":slots,"approvalProbability":None,"completionRange":{"lower":score_value,"upper":displayed(upper)},"inputFingerprint":fingerprint,"totalDocuments":len(current),"totalRequiredDocuments":required_count,"submittedRequiredDocuments":submitted_required,"verifiedRequiredDocuments":verified_required,"submissionCompleteness":displayed(D(100)*submitted_required/required_count) if required_count else 100.0,"verificationPercentage":displayed(D(100)*verified_required/required_count) if required_count else 100.0,"verifiedDocuments":sum(s=="VERIFIED" and (is_photo_document(d, requirement_by_id.get(str(d.get("requirementId") or d.get("requirement") or ""))) or has_completed_ocr(d)) for d,s in zip(current,statuses)),"ocrCompletedDocuments":sum(has_completed_ocr(d) for d in current),"processingDocuments":processing,"failedDocuments":failed,"rejectedDocuments":sum(s=="REJECTED" for s in statuses),"needsReviewDocuments":sum(s in {"PARTIAL","NEEDS_REVIEW","SUSPICIOUS"} for s in statuses),"insufficientDataDocuments":sum(s=="INSUFFICIENT_DATA" for s in statuses),"missingRequiredDocuments":[{"requirementId":s["requirementId"],"name":s["name"]} for s in slots if s["required"] and not s["documentIds"]],"documentProcessingStatus":status,"lastCalculationAt":calculated,"ocrProgress":{"pagesProcessed":processed,"totalPages":pages,"percentage":round(100*processed/pages,2) if pages else 0},"disclaimer":"Evidence strength is not visa approval probability or proof of document authenticity."}
+    return {"scoringVersion":VERSION,"policyVersionId":str(policy.get("id") or policy.get("_id") or ""),"policyVersion":policy.get("version"),"configurationValid":True,"status":status,"complete":not gates and not processing,"gates":gates,"confirmedReadinessPoints":score_value,"confirmedReadinessNormalized":float(total/total_maximum) if total_maximum else 0.0,"exactPoints":str(total),"documentAssessmentScore":score_percentage,"documentReadiness":score_percentage,"earnedPoints":score_value,"verifiedPoints":score_value,"maximumPoints":displayed(total_maximum),"totalAvailablePoints":displayed(total_maximum),"requirementScores":slots,"approvalProbability":None,"completionRange":{"lower":score_value,"upper":displayed(upper)},"inputFingerprint":fingerprint,"totalDocuments":len(current),"totalRequiredDocuments":required_count,"submittedRequiredDocuments":submitted_required,"verifiedRequiredDocuments":verified_required,"submissionCompleteness":displayed(D(100)*submitted_required/required_count) if required_count else 100.0,"verificationPercentage":displayed(D(100)*verified_required/required_count) if required_count else 100.0,"verifiedDocuments":sum(s=="VERIFIED" and (is_photo_document(d, requirement_by_id.get(str(d.get("requirementId") or d.get("requirement") or ""))) or has_completed_ocr(d)) for d,s in zip(current,statuses)),"ocrCompletedDocuments":sum(has_completed_ocr(d) for d in current),"processingDocuments":processing,"failedDocuments":failed,"rejectedDocuments":sum(s=="REJECTED" for s in statuses),"needsReviewDocuments":sum(s in {"PARTIAL","NEEDS_REVIEW","SUSPICIOUS"} for s in statuses),"insufficientDataDocuments":sum(s=="INSUFFICIENT_DATA" for s in statuses),"missingRequiredDocuments":[{"requirementId":s["requirementId"],"name":s["name"]} for s in slots if s["required"] and not s["documentIds"]],"documentProcessingStatus":status,"lastCalculationAt":calculated,"ocrProgress":{"pagesProcessed":processed,"totalPages":pages,"percentage":round(100*processed/pages,2) if pages else 0},"disclaimer":"Evidence strength is not visa approval probability or proof of document authenticity."}

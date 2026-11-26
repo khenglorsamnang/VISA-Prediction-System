@@ -15,7 +15,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from ..core.errors import APIError
 from ..services.evidence_scoring import SCORING_FIELDS, normalize_scoring_fields
-from ..services.policy_profiles import application_profile_fields, requirement_snapshot
+from ..services.policy_profiles import requirement_snapshot
 from . import requirements as requirements_api
 from .dependencies import get_current_principal, get_mongo_database, require_roles
 from .mongo_helpers import id_query, public_document, reference_query
@@ -90,11 +90,8 @@ def _requirement_formats_error(requirement: dict[str, Any]) -> str | None:
     name = str(requirement.get("name") or "")
     code = str(requirement.get("code") or "")
     is_photo = "photo" in name.casefold() or "photo" in code.casefold() or "photograph" in name.casefold()
-    required_formats = {"jpg", "jpeg", "png"} if is_photo else allowed
-    if formats != required_formats:
-        if is_photo:
-            return "Applicant photos support JPG, JPEG, and PNG only"
-        return "Supporting documents must accept PDF, JPG, JPEG, and PNG"
+    if is_photo and "pdf" in formats:
+        return "Applicant photos support JPG, JPEG, and PNG only"
     return None
 
 
@@ -120,6 +117,7 @@ async def _save_visa_and_requirements(
         return JSONResponse(status_code=400, content={"message": error_message})
 
     names: set[str] = set()
+    codes: set[str] = set()
     for requirement in requirement_payloads:
         name = str(requirement.get("name") or "").strip() if isinstance(requirement, dict) else ""
         if not name:
@@ -134,6 +132,16 @@ async def _save_visa_and_requirements(
                 content={"message": "Requirement names must be unique for this VISA Type", "failedRequirement": name},
             )
         names.add(key)
+        code = str(
+            requirement.get("code")
+            or re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+        ).strip().casefold()
+        if not code or code in codes:
+            return JSONResponse(
+                status_code=400,
+                content={"message": "Requirement codes must be unique for this VISA Type", "failedRequirement": name},
+            )
+        codes.add(code)
         validation_error = requirements_api._validate(requirement)
         validation_error = validation_error or _requirement_formats_error(requirement)
         if validation_error:
@@ -152,6 +160,9 @@ async def _save_visa_and_requirements(
                 status_code=400,
                 content={"message": "Status must be ACTIVE, INACTIVE, or ARCHIVED", "failedRequirement": name},
             )
+    total_error = requirements_api._validate_configuration_total(requirement_payloads)
+    if total_error:
+        return JSONResponse(status_code=400, content={"message": total_error})
 
     visa_collection = database["visatypes"]
     requirement_collection = database["visarequirements"]
@@ -175,6 +186,9 @@ async def _save_visa_and_requirements(
         ).to_list(length=None) if current_visa else []
 
         now = datetime.now(timezone.utc)
+        configuration_version = int(
+            (current_visa or {}).get("requirementsConfigurationVersion") or 0
+        ) + 1
         if current_visa:
             visa_type = dict(current_visa)
             for field in VISA_FIELDS:
@@ -183,6 +197,8 @@ async def _save_visa_and_requirements(
             visa_type["countryId"] = country["_id"]
             visa_type["countryCode"] = visa_payload.get("countryCode") or country.get("isoCode", "")
             visa_type["destination"] = visa_payload.get("destination") or country.get("name", "")
+            visa_type["requirementsConfigurationVersion"] = configuration_version
+            visa_type["requirementsConfigurationUpdatedAt"] = now
             visa_type["updatedAt"] = now
             await visa_collection.replace_one({"_id": current_visa["_id"]}, visa_type)
         else:
@@ -195,6 +211,8 @@ async def _save_visa_and_requirements(
                     "destination": visa_payload.get("destination") or country.get("name", ""),
                     "visaTypeCode": str(visa_payload.get("visaTypeCode") or _visa_code(visa_payload)),
                     "active": visa_payload.get("active", True),
+                    "requirementsConfigurationVersion": configuration_version,
+                    "requirementsConfigurationUpdatedAt": now,
                     "createdAt": now,
                     "updatedAt": now,
                 }
@@ -230,6 +248,7 @@ async def _save_visa_and_requirements(
                     "required": requirement_payload["required"],
                     "conditional": requirement_payload.get("conditional", False),
                     "weight": float(requirement_payload.get("maximumEarnedPoints", requirement_payload.get("weight", 0))),
+                    "maximumEarnedPoints": float(requirement_payload.get("maximumEarnedPoints", requirement_payload.get("weight", 0))),
                     "displayOrder": int(requirement_payload.get("displayOrder") or 0),
                     "maxFileSize": int(requirement_payload["maxFileSize"]),
                     "source": str(requirement_payload.get("source") or ""),
@@ -240,6 +259,7 @@ async def _save_visa_and_requirements(
                     ),
                     "allowMultiple": requirement_payload.get("allowMultiple", False),
                     "status": str(requirement_payload["status"]).upper(),
+                    "configurationVersion": configuration_version,
                     "updatedAt": now,
                 }
             )
@@ -269,6 +289,7 @@ async def _save_visa_and_requirements(
                         "visaTypeId": visa_type["_id"],
                         "action": "UPDATE" if existing else "CREATE",
                         "adminId": principal["id"],
+                        "configurationVersion": configuration_version,
                         "previous": requirements_api._public_requirement(existing) if existing else None,
                         "current": requirements_api._public_requirement(requirement),
                         "createdAt": now,
@@ -289,8 +310,27 @@ async def _save_visa_and_requirements(
                 if referenced:
                     archived = {**previous, "status": "ARCHIVED", "updatedAt": datetime.now(timezone.utc)}
                     await requirement_collection.replace_one({"_id": previous["_id"]}, archived)
+                    action = "ARCHIVE"
                 else:
                     await requirement_collection.delete_one({"_id": previous["_id"]})
+                    archived = None
+                    action = "DELETE"
+                history_id = ObjectId()
+                history_ids.append(history_id)
+                await database["requirementversions"].insert_one(
+                    {
+                        "_id": history_id,
+                        "requirementId": previous["_id"],
+                        "visaTypeId": visa_type["_id"],
+                        "action": action,
+                        "adminId": principal["id"],
+                        "configurationVersion": configuration_version,
+                        "previous": requirements_api._public_requirement(previous),
+                        "current": requirements_api._public_requirement(archived) if archived else None,
+                        "createdAt": now,
+                        "updatedAt": now,
+                    }
+                )
             except Exception as error:
                 raise _RequirementSaveFailure(str(previous.get("name") or "Unknown requirement"), error) from error
 
@@ -312,7 +352,6 @@ async def _save_visa_and_requirements(
                 )
         if not reloaded_visa or reloaded_visa.get("visaTypeCode") != visa_type.get("visaTypeCode"):
             raise RuntimeError("Persisted VISA Type could not be verified")
-        await requirements_api._refresh_application_scores(database, visa_type["_id"])
     except Exception as error:
         logger.exception("Could not save VISA Type requirements consistently")
         try:
@@ -695,19 +734,15 @@ async def create_application(
             return JSONResponse(status_code=404, content={"message": "Customer not found"})
         if not visa_type or not visa_type.get("active", True):
             return JSONResponse(status_code=404, content={"message": "Active visa type not found"})
-        # Resolve the immutable published policy first. Mutable live rows may
-        # have been archived or edited since publication and are not its source.
-        profile_fields = await application_profile_fields(database, visa_type["_id"])
-        if profile_fields:
-            requirements = profile_fields["requirementSnapshot"]
-        else:
-            requirements = await database["visarequirements"].find(
-                {
-                    **reference_query("visaTypeId", str(visa_type["_id"])),
-                    "status": "ACTIVE",
-                }
-            ).to_list(length=None)
-        if not requirements and not profile_fields:
+        # Snapshot the current active requirements so later edits do not
+        # silently change this application's scoring configuration.
+        requirements = await database["visarequirements"].find(
+            {
+                **reference_query("visaTypeId", str(visa_type["_id"])),
+                "status": "ACTIVE",
+            }
+        ).to_list(length=None)
+        if not requirements:
             return JSONResponse(status_code=409, content={"message": "Visa type has no active requirements"})
         now = datetime.now(timezone.utc)
         application_id = str(uuid4())
@@ -721,6 +756,9 @@ async def create_application(
             "destination": visa_type.get("destination"),
             "visaCategory": visa_type.get("category"),
             "requirementSnapshot": [requirement_snapshot(item) for item in requirements],
+            "requirementsConfigurationVersion": visa_type.get(
+                "requirementsConfigurationVersion", 0
+            ),
             "travelStartDate": payload.get("travelStartDate"),
             "returnDate": payload.get("returnDate"),
             "status": "DRAFT",
@@ -729,7 +767,6 @@ async def create_application(
             "createdAt": now,
             "updatedAt": now,
         }
-        application.update(profile_fields)
         if isinstance(payload.get("applicantContext"), dict):
             application["applicantContext"] = payload["applicantContext"]
         await database["visaapplications"].insert_one(application)

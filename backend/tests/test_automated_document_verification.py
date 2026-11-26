@@ -39,14 +39,17 @@ def _applicant() -> dict:
     }
 
 
-def _bank_statement(closing_balance: str = "1050.00") -> dict:
+def _bank_statement(
+    closing_balance: str = "1050.00",
+    account_holder_name: str = "Ada Example",
+) -> dict:
     return {
         "requirementCode": "bank_statement",
         "ocrStatus": "OCR_COMPLETED",
         "ocrConfidence": 0.92,
         "extractedFields": {
             "bankName": "Example Bank",
-            "accountHolderName": "Ada Example",
+            "accountHolderName": account_holder_name,
             "accountNumber": "123456789",
             "openingBalance": "1000.00",
             "closingBalance": closing_balance,
@@ -372,6 +375,34 @@ def test_bank_statement_reconciliation_and_exact_duplicate_detection():
     assert any(check["code"] == "DUPLICATE_DOCUMENT" for check in duplicate["checks"])
 
 
+def test_bank_statement_with_different_account_holder_is_not_name_reviewed():
+    financial_analysis = {
+        "financialRequirementStatus": "PASS",
+        "reviewFlags": [],
+    }
+    matching = evaluate_automated_document_verification(
+        _bank_statement(),
+        _applicant(),
+        {"code": "bank_statement"},
+        bank_statement_analysis=financial_analysis,
+        now=_NOW,
+    )
+    different_holder = evaluate_automated_document_verification(
+        _bank_statement(account_holder_name="SIM KEE SIANG"),
+        _applicant(),
+        {"code": "bank_statement"},
+        bank_statement_analysis=financial_analysis,
+        now=_NOW,
+    )
+
+    assert different_holder["status"] == matching["status"] == "VERIFIED"
+    assert different_holder["documentScore"] == matching["documentScore"]
+    assert not any(
+        check["code"] in {"ACCOUNT_HOLDER_MATCH", "NAME_MISMATCH"}
+        for check in different_holder["checks"]
+    )
+
+
 def test_bank_statement_without_three_month_financial_analysis_is_not_verified():
     result = evaluate_automated_document_verification(
         _bank_statement(),
@@ -386,6 +417,35 @@ def test_bank_statement_without_three_month_financial_analysis_is_not_verified()
         and check["status"] == "INSUFFICIENT_DATA"
         for check in result["checks"]
     )
+
+
+def test_bank_statement_below_minimum_is_warning_for_manual_review_not_failure():
+    result = evaluate_automated_document_verification(
+        _bank_statement(),
+        _applicant(),
+        {"code": "bank_statement"},
+        bank_statement_analysis={
+            "financialRequirementStatus": "BELOW_MINIMUM",
+            "minimumBalanceAssessment": {
+                "balance": 3084.87,
+                "currency": "USD",
+                "minimum": 4000,
+                "shortfall": 915.13,
+            },
+            "reviewFlags": [],
+        },
+        now=_NOW,
+    )
+
+    financial_check = next(
+        check
+        for check in result["checks"]
+        if check["code"] == "BANK_FINANCIAL_REQUIREMENT"
+    )
+    assert result["status"] == "NEEDS_REVIEW"
+    assert financial_check["status"] == "NEEDS_REVIEW"
+    assert "915.13" in financial_check["reason"]
+    assert not result["failedChecks"]
 
 
 def test_partial_ocr_and_unsupported_types_cannot_be_verified():

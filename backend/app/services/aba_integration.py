@@ -28,6 +28,65 @@ def minor_to_major(value: Any) -> float | None:
     return float(Decimal(str(value)) / Decimal(100))
 
 
+def _review_blockers(
+    result: dict[str, Any], statement: dict[str, Any]
+) -> list[dict[str, Any]]:
+    currency = statement.get("currency")
+    blockers = []
+    for issue in result.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        blocker = {
+            "code": issue.get("code") or "unresolved_evidence",
+            "message": issue.get("message") or "An extraction or financial check requires review.",
+        }
+        for key in ("field", "page", "row", "pages"):
+            if issue.get(key) is not None:
+                blocker[key] = issue[key]
+        if issue.get("code") == "summary_field_conflict" and issue.get("field"):
+            candidates = (
+                (statement.get("metadata_sources") or {})
+                .get(issue["field"], {})
+                .get("candidates", [])
+            )
+            blocker["candidates"] = [
+                {
+                    "page": candidate.get("page"),
+                    "raw": candidate.get("raw"),
+                    "value": minor_to_major(candidate.get("value")),
+                    "currency": currency,
+                }
+                for candidate in candidates
+            ]
+        for key in ("expected", "actual", "difference"):
+            if isinstance(issue.get(key), (int, float)):
+                blocker[key] = minor_to_major(issue[key])
+                blocker[f"{key}Units"] = "major"
+        if any(key in blocker for key in ("expected", "actual", "difference")):
+            blocker["currency"] = currency
+        blockers.append(blocker)
+
+    score = result.get("score") or {}
+    metrics = result.get("metrics") or {}
+    config = score.get("config") or DEFAULT_CONFIG
+    if score.get("provisional"):
+        days = metrics.get("days")
+        final_days = config.get("final_days")
+        blockers.append({
+            "code": "provisional_history",
+            "message": (
+                f"The statement score is provisional: {days} days are available; "
+                f"{final_days} days are required for a final score."
+            ),
+        })
+    elif score.get("value") is None and not blockers and score.get("label"):
+        blockers.append({
+            "code": "score_unavailable",
+            "message": str(score["label"]),
+        })
+    return blockers
+
+
 def normalized_bank_quality(score: Any) -> str | None:
     if score is None or isinstance(score, bool):
         return None
@@ -77,14 +136,55 @@ def analysis_from_statement(statement: dict[str, Any], *, source: dict[str, Any]
         "documentId": source.get("documentId"),
         "applicationId": source.get("applicationId"),
         "requirementId": source.get("requirementId"),
+        "ocrStatus": "OCR_COMPLETED",
+        "ocrConfidence": None,
         "statementStrengthScore": final_score,
         "normalizedQuality": normalized_bank_quality(final_score),
+        "extractionStatus": (
+            "NEEDS_REVIEW"
+            if statement.get("extraction_issues")
+            or any(
+                issue.get("code")
+                in {"missing_fields", "unreadable_row", "ordering", "row_date"}
+                for issue in result.get("issues", [])
+            )
+            else "EXTRACTED"
+        ),
+        "financialEvidenceStatus": (
+            "RECONCILED" if result.get("status") == "Reconciled" else "NEEDS_REVIEW"
+        ),
+        "monthlyBalanceVerification": {
+            "status": (
+                "INSUFFICIENT_DATA"
+                if not result.get("monthly")
+                else "PASS"
+                if result.get("status") == "Reconciled"
+                else "NEEDS_REVIEW"
+            ),
+            "months": [
+                {
+                    "month": item["month"],
+                    "closingBalance": minor_to_major(item.get("ending")),
+                    "currency": statement.get("currency"),
+                    "sourceDate": item.get("source_date"),
+                    "sourcePage": item.get("source_page"),
+                    "sourceTransaction": item.get("source_transaction"),
+                    "evidenceType": item.get("evidence_type"),
+                }
+                for item in result.get("monthly", [])
+            ],
+        },
+        "accountHolderExtractionStatus": (
+            "EXTRACTED" if statement.get("holder") else "MISSING"
+        ),
+        "fieldEvidence": deepcopy(statement.get("metadata_sources") or {}),
+        "reviewBlockers": _review_blockers(result, statement),
         "mappingVersion": MAPPING_VERSION,
         "modelVersion": result["score"]["config"]["version"],
         "scoringConfig": result["score"]["config"],
         "reconciliationStatus": "RECONCILED" if result["status"] == "Reconciled" else "NEEDS_REVIEW",
         "reviewStatus": "PENDING_REVIEW",
-        "ownerRelationship": previous.get("ownerRelationship", "UNCONFIRMED"),
+        "ownerRelationship": previous.get("ownerRelationship", "UNASSESSED"),
         "ownerRelationshipConfirmed": False,
         "authenticityStatus": "NOT_VERIFIED",
         "statement": statement,
@@ -122,7 +222,12 @@ def analyze_aba_pdf(content: bytes, filename: str, *, password: str = "", docume
             "statementStrengthScore": None, "normalizedQuality": None, "modelVersion": DEFAULT_CONFIG["version"],
             "scoringConfig": deepcopy(DEFAULT_CONFIG), "mappingVersion": MAPPING_VERSION,
             "reconciliationStatus": "NEEDS_REVIEW", "reviewStatus": "PENDING_REVIEW",
-            "ownerRelationship": "UNCONFIRMED", "ownerRelationshipConfirmed": False,
+            "ocrStatus": "OCR_FAILED", "ocrConfidence": None,
+            "ownerRelationship": "UNASSESSED", "ownerRelationshipConfirmed": False,
+            "extractionStatus": "NEEDS_REVIEW", "financialEvidenceStatus": "NEEDS_REVIEW",
+            "monthlyBalanceVerification": {"status": "INSUFFICIENT_DATA", "months": []},
+            "accountHolderExtractionStatus": "MISSING",
+            "fieldEvidence": {}, "reviewBlockers": [{"code": "extraction_failed", "message": message}],
             "authenticityStatus": "NOT_VERIFIED", "source": {**source, "units": "minor"},
             "statement": None, "metrics": None, "daily": [], "monthly": [], "transactions": [], "checks": [],
             "issues": [{"code": "password_required" if message.startswith("PASSWORD_REQUIRED") else "extraction_failed", "message": message}],
@@ -151,7 +256,7 @@ def aba_to_legacy_ocr(analysis: dict[str, Any]) -> dict[str, Any]:
             "sourceUnits": "minor", "units": "major", "sourceAnalysisRevision": analysis["analysisRevision"],
         })
     fields = {
-        "bankName": "ABA Bank", "accountHolderName": statement.get("holder"),
+        "bankName": statement.get("bank"), "accountHolderName": statement.get("holder"),
         "accountNumber": statement.get("account"), "currency": currency,
         "openingBalance": minor_to_major(statement.get("opening")),
         "closingBalance": minor_to_major(statement.get("ending")),
@@ -236,18 +341,13 @@ def reviewed_analysis(analysis: dict[str, Any], payload: dict[str, Any], actor_i
             raise ValueError("Extraction must complete before source resolution.")
         statement["extraction_issues"] = [i for i in statement.get("extraction_issues", []) if i["code"] != "correction_requires_resolution"]
         result = analysis_from_statement(statement, source=analysis["source"], previous=analysis)
-    relationship = str(payload.get("ownerRelationship") or "UNCONFIRMED").upper()
     if status == "VERIFIED":
         if result.get("statementStrengthScore") is None or result.get("reconciliationStatus") != "RECONCILED" or result.get("score", {}).get("provisional"):
             raise ValueError("Exact reconciliation and sufficient non-provisional history must pass before verification.")
-        if relationship not in {"APPLICANT", "JOINT", "BUSINESS", "SPONSOR"} or payload.get("ownerRelationshipConfirmed") is not True:
-            raise ValueError("Confirm the documented account-holder relationship before verification.")
     result["reviewStatus"] = status
     result["analysisRevision"] = str(uuid4())
-    result["ownerRelationship"] = relationship
-    result["ownerRelationshipConfirmed"] = payload.get("ownerRelationshipConfirmed") is True if status == "VERIFIED" else False
     result["audit"].append({"type": "STAFF_REVIEW", "status": status, "reason": reason, "actorId": actor_id,
-                            "ownerRelationship": relationship, "at": datetime.now(timezone.utc).isoformat()})
+                            "at": datetime.now(timezone.utc).isoformat()})
     return result
 
 

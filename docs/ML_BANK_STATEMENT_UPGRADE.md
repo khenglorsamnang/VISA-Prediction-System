@@ -4,8 +4,9 @@
 
 Financial calculations and destination requirements are internal review aids, not official embassy requirements, fraud findings, or guarantees of visa approval. A financial score is separate from visa approval probability. No probability is generated until an Admin-reviewed, approved, and active visa model is available. OCR results, workflow statuses, synthetic records, and model outputs must not be presented as verified outcomes.
 
-The integrated bank-statement review evaluates explicitly extracted closing balances for the latest three complete calendar months, requiring each to meet the configurable USD minimum (default USD 4,000). Missing month-end evidence, incomplete statement periods, and non-USD balances produce manual review; no exchange rate or missing balance is inferred. The separate configurable bank score totals 50 points by default (20 balance stability, 15 transaction history, 10 source-of-funds consistency, 5 document completeness/consistency). It is not the general financial score, configured document readiness, an authenticity result, or an approval probability.
-The bank quality response also exposes `percentage = points / 50 * 100` and `evidenceCoveragePercentage = available component maximum / 50 * 100`. The percentage must always be read together with evidence coverage. The `assessment` is `INSUFFICIENT_DATA` when OCR is incomplete, the three-month financial requirement cannot be evaluated, or evidence coverage is below 80%; `BELOW_REQUIREMENT` when a monthly closing balance fails the configured minimum; otherwise `GOOD` (80%+), `FAIR` (65–79.99%), or `WEAK` (below 65%). These are internal triage labels, not a bank's credit rating or an embassy decision.
+The canonical Bank Statement score evaluates the latest three complete calendar months as one dataset and totals 45 points: Ending Balance (22.50), Starting Balance (6.75), Transaction History (9.00), and Transaction Period (6.75). It uses the actual opening and closing balances at the scoring-period boundaries and all dated transactions in that period. Transaction Period checks complete three-month statement coverage, supported by dated transactions in the same period. Available components begin at their maximum points; configured, unique flags reduce only their mapped component: Money In >= USD 2,000 and Money Out >= USD 1,000 deduct 10% of Transaction History per qualifying transaction, each monthly close below USD 4,000 deducts 10% of Ending Balance, and an unconfirmed source deducts the configured 0.50 points from Transaction History. Deductions are deduplicated by document ID, transaction ID, and flag type, and capped at the component maximum. Confirmed sources do not receive a source deduction. Monthly closing balances are supporting information and do not receive separate scores. Available extracted or transaction-running balances remain visible with their source references; an unavailable intermediate monthly close does not invalidate otherwise available period-level scoring evidence. Conflicting boundary balances or incomplete period evidence require review, and missing values are never inferred. A below-minimum balance remains a manual-review condition and is not by itself a document failure.
+
+The score percentage is `points / 45 * 100`, and evidence coverage is `available component maximum / 45 * 100`. The score is separate from the general financial score, document readiness, authenticity, and approval probability. These are internal triage results, not a bank's credit rating or an embassy decision.
 
 The database stores original OCR data for authorized backend workflows. Public document and bank-analysis responses mask account numbers. Full document access remains restricted to the document owner or staff roles. Do not add statement text, account numbers, names, or raw datasets to application logs.
 
@@ -88,8 +89,9 @@ All routes below are under `/api` and require bearer authentication. Admin-only 
 Application creation uses the existing document upload and verification workflow.
 Once OCR completes, **Verify** returns a provisional completeness result and the
 bank analysis immediately. The detailed verification report and final receipt show
-the month-by-month closing-balance checks, transaction summaries, reconciliation,
-score components, and manual-review flags. Pending files remain unverified and
+the single four-component Bank Statement score, monthly closing balances as
+supporting information, transaction summaries, reconciliation, and manual-review
+warnings. Pending files remain unverified and
 never increase the confirmed readiness score. The staff-only
 `/bank-statements/analyze` endpoint remains available for standalone analyses.
 

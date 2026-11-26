@@ -309,6 +309,7 @@ def normalize_transactions(
             page = None
 
         canonical = {
+            "transactionIndex": index,
             "date": transaction_date.isoformat() if transaction_date else None,
             "description": description,
             "amount": round(amount, 2) if amount is not None else None,
@@ -324,6 +325,9 @@ def normalize_transactions(
             "runningBalance": round(running_balance, 2) if running_balance is not None else None,
             "sourceText": evidence,
             "referenceNumber": _first(record, ("referenceNumber", "reference_number", "reference", "transactionId", "transaction_id")),
+            "sender": _first(record, ("sender", "senderName", "sender_name", "originator")),
+            "receiver": _first(record, ("receiver", "receiverName", "receiver_name", "beneficiary")),
+            "counterparty": _first(record, ("counterparty", "counterpartyName", "counterparty_name")),
             # Preserve ABA evidence provenance without reinterpreting minor-unit
             # source amounts as this legacy major-unit transaction contract.
             **{key: record[key] for key in ("sourceRowId", "bbox", "sourceAnalysisRevision", "sourceUnits", "units") if key in record},

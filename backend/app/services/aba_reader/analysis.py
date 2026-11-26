@@ -88,9 +88,15 @@ def analyze(statement, config=DEFAULT_CONFIG):
         mi, mo = sum(t["money_in"] or 0 for t in tx), sum(t["money_out"] or 0 for t in tx)
         first = date.fromisoformat(days[0]["date"])
         last = date.fromisoformat(days[-1]["date"])
+        closing_day = days[-1]
+        source_transaction = closing_day["source_transaction"]
         monthly.append({"month": month, "money_in": mi, "money_out": mo, "net": mi-mo,
                         "average": str(Decimal(sum(d["balance"] for d in days))/len(days)), "ending": days[-1]["balance"],
-                        "days": len(days), "partial": first.day != 1 or (last+timedelta(days=1)).month == last.month})
+                        "days": len(days), "partial": first.day != 1 or (last+timedelta(days=1)).month == last.month,
+                        "source_date": row_lookup[source_transaction]["date"] if source_transaction is not None else None,
+                        "source_page": closing_day["source_page"],
+                        "source_transaction": source_transaction,
+                        "evidence_type": "DERIVED_DAILY_CLOSING"})
     final_week = [t for t in rows if (end-date.fromisoformat(t["date"])).days in range(7)]
     largest_final = max((t["money_in"] or 0 for t in final_week), default=0)
     ref = balances[-config["reference_days"]:-config["excluded_final_days"]] if n >= config["reference_days"] else []

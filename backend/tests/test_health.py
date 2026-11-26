@@ -87,9 +87,9 @@ def test_cors_preflight_allows_frontend_origin(monkeypatch) -> None:
 
 def test_bank_statement_analysis_routes_are_registered() -> None:
     paths = {
-        route.path
-        for route in main.app.routes
-        if route.path.startswith("/api/bank-statements")
+        path
+        for path in main.app.openapi()["paths"]
+        if path.startswith("/api/bank-statements")
     }
 
     assert paths == {
@@ -103,12 +103,14 @@ def test_bank_statement_analysis_routes_are_registered() -> None:
         "/api/bank-statements/documents/{document_id}/aba/page/{page}",
         "/api/bank-statements/documents/{document_id}/aba/corrections",
         "/api/bank-statements/documents/{document_id}/aba/review",
+        "/api/bank-statements/documents/{document_id}/transactions/{transaction_index}/source-review",
         "/api/bank-statements/documents/{document_id}/aba/select-primary",
+        "/api/bank-statements/documents/{document_id}/aba/verify",
     }
 
 
 def test_ml_and_document_ocr_routes_are_registered() -> None:
-    paths = {route.path for route in main.app.routes}
+    paths = set(main.app.openapi()["paths"])
 
     assert {
         "/api/documents/ocr",

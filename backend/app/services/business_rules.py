@@ -3,9 +3,13 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, timedelta
 import math
+import re
 from typing import Any
 
-from .bank_statement_scoring import DEFAULT_BANK_STATEMENT_SCORING
+from .bank_statement_scoring import (
+    DEFAULT_BANK_STATEMENT_SCORING,
+    SOURCE_UNVERIFIED_PENALTY_POINTS,
+)
 from .financial_analysis import DEFAULT_SCORING_CONFIG
 
 _EVIDENCE_KEYS = {
@@ -127,6 +131,30 @@ def _reject_unknown_keys(value: dict[str, Any], allowed: set[str], path: str) ->
 def _is_cambodian(nationality: Any) -> bool:
     value = _normalize_country(nationality)
     return value in {"khm", "cambodian", "cambodia", "cambodian citizen"}
+
+
+def configured_bank_balance_requirement(
+    policy: dict[str, Any],
+    destination: Any,
+    nationality: Any,
+) -> float | None:
+    """Resolve the configured destination/nationality balance rule without guessing."""
+    destination_rules = policy.get("destination_rules")
+    if not isinstance(destination_rules, dict):
+        return None
+    rule = destination_rules.get(_normalize_country(destination))
+    if not isinstance(rule, dict) or not str(nationality or "").strip():
+        return None
+    key = "cambodian_balance_usd" if _is_cambodian(nationality) else "foreigner_balance_usd"
+    value = rule.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        return None
+    return float(value)
 
 
 def _bool_check(value: Any, title: str, true_is_pass: bool = True) -> dict[str, Any]:
@@ -378,14 +406,49 @@ def validate_rule_policy(value: Any) -> dict[str, Any]:
     )
     if not isinstance(bank_scoring, dict):
         raise ValueError("bank_statement_scoring must be an object.")
+    if set(bank_scoring.get("weights", {})) == {
+        "three_month_balance_stability",
+        "transaction_history_quality",
+        "source_of_funds_consistency",
+        "document_completeness_consistency",
+    }:
+        bank_scoring = {
+            **bank_scoring,
+            "weights": deepcopy(candidate["bank_statement_scoring"]["weights"]),
+        }
+    if bank_scoring.get("weights") == {
+        "ending_balance": 15.75,
+        "starting_balance": 15.75,
+        "transaction_history": 6.75,
+        "transaction_period": 6.75,
+    }:
+        bank_scoring = {
+            **bank_scoring,
+            "weights": deepcopy(candidate["bank_statement_scoring"]["weights"]),
+        }
     _reject_unknown_keys(
         bank_scoring,
         {
             "minimum_monthly_closing_balance_usd",
             "full_balance_score_usd",
+            "money_in_flag_threshold_usd",
+            "money_out_flag_threshold_usd",
+            "money_in_flag_deduction_percent",
+            "money_out_flag_deduction_percent",
+            "monthly_low_balance_flag_deduction_percent",
+            "minimum_statement_period_days",
+            "ending_balance_recent_withdrawal_days",
+            "historical_pattern_deviation_ratio",
             "recent_large_deposit_days",
             "rapid_funds_outflow_days",
             "rapid_funds_outflow_ratio",
+            "unverified_source_penalty_points",
+            "deduct_pending_source_review",
+            "maximum_transaction_history_penalty",
+            "require_source_evidence_for_confirmation",
+            "minimum_source_review_notes_length",
+            "staff_review_threshold_usd",
+            "staff_review_exchange_rates_to_usd",
             "weights",
         },
         "bank_statement_scoring",
@@ -394,6 +457,8 @@ def validate_rule_policy(value: Any) -> dict[str, Any]:
     for field in (
         "minimum_monthly_closing_balance_usd",
         "full_balance_score_usd",
+        "money_in_flag_threshold_usd",
+        "money_out_flag_threshold_usd",
     ):
         number = bank_scoring.get(field, bank_config[field])
         if (
@@ -407,17 +472,121 @@ def validate_rule_policy(value: Any) -> dict[str, Any]:
     for field, maximum in (
         ("recent_large_deposit_days", 365),
         ("rapid_funds_outflow_days", 30),
+        ("minimum_statement_period_days", 366),
+        ("ending_balance_recent_withdrawal_days", 30),
+        ("minimum_source_review_notes_length", 500),
     ):
         number = bank_scoring.get(field, bank_config[field])
         if (
             isinstance(number, bool)
             or not isinstance(number, int)
-            or not 1 <= number <= maximum
+            or not (0 <= number <= maximum if field == "minimum_source_review_notes_length" else 1 <= number <= maximum)
         ):
             raise ValueError(
-                f"bank_statement_scoring.{field} must be between 1 and {maximum}."
+                f"bank_statement_scoring.{field} is outside its allowed range."
             )
         bank_config[field] = number
+    for field in (
+        "unverified_source_penalty_points",
+        "maximum_transaction_history_penalty",
+    ):
+        number = bank_scoring.get(field, bank_config[field])
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+            or number < 0
+        ):
+            raise ValueError(f"bank_statement_scoring.{field} must be non-negative.")
+        bank_config[field] = float(number)
+    if bank_config["unverified_source_penalty_points"] > 9.0:
+        raise ValueError(
+            "bank_statement_scoring.unverified_source_penalty_points cannot exceed the transaction-history category maximum."
+        )
+    bank_config["unverified_source_penalty_points"] = (
+        SOURCE_UNVERIFIED_PENALTY_POINTS
+    )
+    if bank_config["maximum_transaction_history_penalty"] > 9.0:
+        raise ValueError(
+            "bank_statement_scoring.maximum_transaction_history_penalty cannot exceed the transaction-history category maximum."
+        )
+    for field in (
+        "money_in_flag_deduction_percent",
+        "money_out_flag_deduction_percent",
+        "monthly_low_balance_flag_deduction_percent",
+    ):
+        number = bank_scoring.get(field, bank_config[field])
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+            or not 0 <= number <= 100
+        ):
+            raise ValueError(
+                f"bank_statement_scoring.{field} must be between 0 and 100."
+            )
+        bank_config[field] = 0.0
+    require_evidence = bank_scoring.get(
+        "require_source_evidence_for_confirmation",
+        bank_config["require_source_evidence_for_confirmation"],
+    )
+    if not isinstance(require_evidence, bool):
+        raise ValueError(
+            "bank_statement_scoring.require_source_evidence_for_confirmation must be boolean."
+        )
+    bank_config["require_source_evidence_for_confirmation"] = require_evidence
+    deduct_pending_source_review = bank_scoring.get(
+        "deduct_pending_source_review",
+        bank_config["deduct_pending_source_review"],
+    )
+    if not isinstance(deduct_pending_source_review, bool):
+        raise ValueError(
+            "bank_statement_scoring.deduct_pending_source_review must be boolean."
+        )
+    bank_config["deduct_pending_source_review"] = False
+    staff_review_threshold = bank_scoring.get(
+        "staff_review_threshold_usd", bank_config["staff_review_threshold_usd"]
+    )
+    if (
+        isinstance(staff_review_threshold, bool)
+        or not isinstance(staff_review_threshold, (int, float))
+        or not math.isfinite(float(staff_review_threshold))
+        or staff_review_threshold <= 0
+    ):
+        raise ValueError(
+            "bank_statement_scoring.staff_review_threshold_usd must be greater than zero."
+        )
+    bank_config["staff_review_threshold_usd"] = float(staff_review_threshold)
+    configured_rates = bank_scoring.get(
+        "staff_review_exchange_rates_to_usd",
+        bank_config["staff_review_exchange_rates_to_usd"],
+    )
+    if not isinstance(configured_rates, dict):
+        raise ValueError(
+            "bank_statement_scoring.staff_review_exchange_rates_to_usd must be an object."
+        )
+    normalized_rates = {"USD": 1.0}
+    for currency, rate in configured_rates.items():
+        code = str(currency).strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", code):
+            raise ValueError(
+                "bank_statement_scoring exchange-rate keys must be three-letter currency codes."
+            )
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(float(rate))
+            or rate <= 0
+        ):
+            raise ValueError(
+                f"bank_statement_scoring exchange rate for {code} must be greater than zero."
+            )
+        if code == "USD" and not math.isclose(float(rate), 1.0):
+            raise ValueError(
+                "bank_statement_scoring USD exchange rate must equal 1."
+            )
+        normalized_rates[code] = float(rate)
+    bank_config["staff_review_exchange_rates_to_usd"] = normalized_rates
     ratio = bank_scoring.get(
         "rapid_funds_outflow_ratio", bank_config["rapid_funds_outflow_ratio"]
     )
@@ -431,6 +600,20 @@ def validate_rule_policy(value: Any) -> dict[str, Any]:
             "bank_statement_scoring.rapid_funds_outflow_ratio must be greater than zero and at most one."
         )
     bank_config["rapid_funds_outflow_ratio"] = float(ratio)
+    historical_ratio = bank_scoring.get(
+        "historical_pattern_deviation_ratio",
+        bank_config["historical_pattern_deviation_ratio"],
+    )
+    if (
+        isinstance(historical_ratio, bool)
+        or not isinstance(historical_ratio, (int, float))
+        or not math.isfinite(float(historical_ratio))
+        or historical_ratio < 1
+    ):
+        raise ValueError(
+            "bank_statement_scoring.historical_pattern_deviation_ratio must be at least one."
+        )
+    bank_config["historical_pattern_deviation_ratio"] = float(historical_ratio)
     bank_weights = bank_scoring.get("weights", bank_config["weights"])
     if (
         not isinstance(bank_weights, dict)
@@ -451,8 +634,18 @@ def validate_rule_policy(value: Any) -> dict[str, Any]:
                 f"Bank statement score weight {key} must be non-negative."
             )
         normalized_bank_weights[key] = float(weight)
-    if abs(sum(normalized_bank_weights.values()) - 50) > 0.01:
-        raise ValueError("Bank statement score weights must total 50.")
+    if abs(sum(normalized_bank_weights.values()) - 45) > 0.01:
+        raise ValueError("Bank statement score weights must total 45.")
+    required_bank_weights = {
+        key: float(weight)
+        for key, weight in candidate["bank_statement_scoring"]["weights"].items()
+    }
+    if normalized_bank_weights != required_bank_weights:
+        raise ValueError(
+            "Bank statement score weights must be Ending Balance 22.50, "
+            "Starting Balance 6.75, Transaction History 9.00, and "
+            "Transaction Period 6.75."
+        )
     bank_config["weights"] = normalized_bank_weights
 
     visa_risk = value.get("visa_risk_scoring", candidate["visa_risk_scoring"])

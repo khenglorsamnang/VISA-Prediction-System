@@ -20,15 +20,20 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from ..core.config import PROJECT_ROOT
 from ..core.errors import APIError
-from ..services.document_metrics import summarize_documents
-from ..services.document_metrics import bank_requirement_points
+from ..services.document_metrics import (
+    bank_requirement_points,
+    requirement_awarded_points,
+    summarize_documents,
+)
 from ..services.assessment_context import (
     ABA_FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA, application_requirements, bank_verified_for_prediction,
     canonical_summary, policy_snapshot, prediction_fingerprint, selected_bank_document, digest,
 )
 from ..services.financial_analysis import calculate_financial_analysis
 from ..services.photo_validation import is_photo_document
-from ..services.readiness_scoring import calculate_readiness_score
+from ..services.readiness_scoring import (
+    calculate_bank_score_assessment,
+)
 from ..services.verification_receipts import create_qr_png, create_receipt_pdf
 from .dependencies import get_mongo_database, require_roles
 from .document_workflow import has_completed_ocr
@@ -131,7 +136,16 @@ def _requirement_points(
         {},
     )
     try:
-        return max(0.0, float(requirement.get("weight", requirement.get("points", 0)) or 0))
+        return max(
+            0.0,
+            float(
+                requirement.get(
+                    "maximumEarnedPoints",
+                    requirement.get("weight", requirement.get("points", 0)),
+                )
+                or 0
+            ),
+        )
     except (TypeError, ValueError):
         return 0.0
 
@@ -142,6 +156,14 @@ def _public_document_result(
     bank_statement_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     public = public_document(document)
+    scoring_document = {
+        **document,
+        **(
+            {"bankStatementAnalysis": bank_statement_analysis}
+            if isinstance(bank_statement_analysis, dict)
+            else {}
+        ),
+    }
     document_id = str(document.get("_id") or "")
     fields = public.get("extractedFields")
     raw_fields = document.get("extractedFields")
@@ -169,7 +191,7 @@ def _public_document_result(
         "pagesProcessed": document.get("ocrPagesProcessed") or 0,
         "totalPages": document.get("ocrTotalPages") or 0,
         "progressPercent": document.get("ocrProgressPercent") or 0,
-        "confidence": document.get("ocrConfidence") or 0,
+        "confidence": document.get("ocrConfidence"),
         "ocrConfidence": document.get("ocrConfidence"),
         "ocrAnalysis": redact_sensitive_data(
             document.get("ocrAnalysis") or {},
@@ -213,8 +235,30 @@ def _public_document_result(
             document.get("manualReviewHistory") or [],
             {str(account_number)} if account_number else set(),
         ),
-        "assignedPoints": _requirement_points(document, requirements),
-        "awardedPoints": document.get("awardedPoints") or 0,
+        "assignedPoints": _requirement_points(
+            next(
+                (
+                    item
+                    for item in requirements
+                    if str(item.get("requirementId") or item.get("_id") or "")
+                    == str(document.get("requirementId") or "")
+                ),
+                {},
+            ),
+            requirements,
+        ),
+        "awardedPoints": requirement_awarded_points(
+            next(
+                (
+                    item
+                    for item in requirements
+                    if str(item.get("requirementId") or item.get("_id") or "")
+                    == str(document.get("requirementId") or "")
+                ),
+                {},
+            ),
+            scoring_document,
+        ),
         "contentUrl": f"/documents/{document_id}/content",
     }
 
@@ -619,8 +663,6 @@ async def get_verification_results(
     summary = canonical_summary(application, requirements, documents, not_applicable)
     if policy_snapshot(application):
         summary["readinessScore"] = {"score":summary.get("confirmedReadinessPoints"), "normalized":summary.get("confirmedReadinessNormalized"), "maximum":100, "status":summary.get("status"), "components":summary.get("requirementScores",[]), "gates":summary.get("gates",[]), "scoringVersion":"evidence-v3", "disclaimer":"Evidence points, not visa approval probability."}
-    else:
-        summary["readinessScore"] = calculate_readiness_score(requirements, documents, customer)
     required_ids = {
         str(item.get("requirementId") or item.get("_id") or "")
         for item in requirements
@@ -697,20 +739,24 @@ async def get_verification_results(
                 document_id = str(entry.get("documentId") or "")
                 analysis = entry.get("analysis")
                 if document_id and isinstance(analysis, dict):
-                    bank_analyses_by_document[document_id] = analysis
+                    # Verification results are historical snapshots; source-review
+                    # updates are persisted on the current document.
+                    bank_analyses_by_document.setdefault(document_id, analysis)
     saved_financial_statuses = {
         str(analysis.get("financialRequirementStatus") or "").upper()
         for analysis in bank_analyses_by_document.values()
     }
     summary["bankStatementAnalysisStatus"] = (
-        latest.get("bankStatementAnalysisStatus", "NOT_AVAILABLE")
-        if latest
-        else "FAIL"
+        "FAIL"
         if "FAIL" in saved_financial_statuses
         else "INSUFFICIENT_DATA"
         if "INSUFFICIENT_DATA" in saved_financial_statuses
+        else "BELOW_MINIMUM"
+        if "BELOW_MINIMUM" in saved_financial_statuses
         else "PASS"
         if "PASS" in saved_financial_statuses
+        else latest.get("bankStatementAnalysisStatus", "NOT_AVAILABLE")
+        if latest
         else "NOT_AVAILABLE"
     )
     requirements_by_id = {
@@ -718,11 +764,106 @@ async def get_verification_results(
         for item in requirements
     }
     documents_by_id = {str(item.get("_id") or ""): item for item in documents}
+    for document in documents:
+        document_id = str(document.get("_id") or "")
+        requirement = requirements_by_id.get(
+            str(document.get("requirementId") or ""),
+            {},
+        )
+        requirement_code = str(
+            document.get("requirementCode")
+            or requirement.get("code")
+            or requirement.get("requirementCode")
+            or ""
+        ).casefold()
+        requirement_name = str(
+            requirement.get("name") or document.get("requirementName") or ""
+        ).casefold()
+        is_bank_document = (
+            "bank_statement" in requirement_code
+            or "fixed_deposit" in requirement_code
+            or ("bank" in requirement_code and "statement" in requirement_code)
+            or ("bank" in requirement_name and "statement" in requirement_name)
+        )
+        analysis = bank_analyses_by_document.get(document_id)
+        if analysis is None and not is_bank_document:
+            continue
+        document = documents_by_id.get(document_id)
+        if document:
+            requirement = requirements_by_id.get(
+                str(document.get("requirementId") or "")
+            )
+            bank_analyses_by_document[document_id] = {
+                **(analysis or {}),
+                **calculate_bank_score_assessment(
+                    document,
+                    analysis or {},
+                    customer,
+                    requirement_maximum=_requirement_points(
+                        requirement or {}, requirements
+                    ),
+                ),
+            }
+    if not policy_snapshot(application):
+        requirement_scores = summary.get("requirementScores") or []
+        missing_required = summary.get("missingRequiredDocuments") or []
+        manual_review_required = any(
+            summary.get(field, 0)
+            for field in (
+                "processingDocuments",
+                "needsReviewDocuments",
+                "insufficientDataDocuments",
+            )
+        )
+        summary["readinessScore"] = {
+            "score": summary.get("documentAssessmentScore", 0),
+            "earnedPoints": summary.get("earnedPoints", 0),
+            "maximum": summary.get("maximumPoints", 0),
+            "riskLevel": "NOT_ASSESSED",
+            "manualReviewRequired": manual_review_required,
+            "reviewFlags": [
+                item.get("name") or item.get("requirementId")
+                for item in requirement_scores
+                if item.get("status") in {"NEEDS_REVIEW", "INSUFFICIENT_DATA"}
+            ],
+            "gateApplied": bool(missing_required),
+            "missingRequiredDocuments": [
+                item.get("name") or "Required document"
+                for item in missing_required
+            ],
+            "components": {
+                item.get("requirementId") or str(index): {
+                    "label": item.get("name") or "Requirement",
+                    "points": item.get("earnedPoints", 0),
+                    "maximum": item.get("configuredPoints", 0),
+                    "status": item.get("status"),
+                }
+                for index, item in enumerate(requirement_scores)
+            },
+            "recommendations": (
+                ["Complete required document review before finalizing."]
+                if missing_required or manual_review_required
+                else []
+            ),
+            "disclaimer": "This percentage is the earned document requirement contribution divided by the configured maximum; it is not an approval probability.",
+        }
     summary["bankStatementScore"] = [
         {
             "documentId": document_id,
             "score": analysis.get("bankStatementScore"),
             "bankDiagnosticScore": analysis.get("bankStatementScore"),
+            "documentScore": analysis.get("documentScore"),
+            "computedBankScore": analysis.get("computedBankScore"),
+            "confirmedBankScore": analysis.get("confirmedBankScore"),
+            "requirementContribution": analysis.get("requirementContribution"),
+            "staffReviewStatus": analysis.get("staffReviewStatus"),
+            "sourceReviewStatus": analysis.get("sourceReviewStatus"),
+            "documentReviewStatus": analysis.get("documentReviewStatus"),
+            "authenticityStatus": analysis.get("authenticityStatus"),
+            "financialEvidenceStatus": analysis.get("financialEvidenceStatus"),
+            "financialAssessmentStatus": analysis.get("financialAssessmentStatus"),
+            "balanceReconciliationStatus": analysis.get("balanceReconciliationStatus"),
+            "monthlyBalanceVerification": analysis.get("monthlyBalanceVerification"),
             "bankRequirementPointsEarned": bank_requirement_points(
                 analysis,
                 _requirement_points(
@@ -733,8 +874,16 @@ async def get_verification_results(
                 ),
                 str(documents_by_id.get(document_id, {}).get("status") or "").upper(),
             ),
+            "bankRequirementPointsMaximum": _requirement_points(
+                requirements_by_id.get(
+                    str(documents_by_id.get(document_id, {}).get("requirementId") or ""),
+                ),
+                requirements,
+            ),
             "financialRequirementStatus": analysis.get("financialRequirementStatus"),
+            "minimumBalanceAssessment": analysis.get("minimumBalanceAssessment"),
             "threeMonthCoverage": analysis.get("statementPeriod"),
+            "monthlyBalanceChecks": analysis.get("monthlyBalanceChecks") or [],
             "missingFinancialFields": analysis.get("missingEvidence") or [],
             "transactionExtraction": {
                 "status": analysis.get("extractionStatus"),
@@ -809,7 +958,10 @@ async def get_verification_results(
                         "name": item.get("name") or "Requirement",
                         "required": item.get("required", True),
                         "conditional": item.get("conditional", False),
-                        "points": item.get("weight", item.get("points", 0)),
+                        "points": item.get(
+                            "maximumEarnedPoints",
+                            item.get("weight", item.get("points", 0)),
+                        ),
                     }
                     for item in requirements
                 ],
@@ -835,7 +987,8 @@ async def get_verification_results(
                 "assessmentNeedsRefinalization":bool(last_receipt and not receipt_current),
                 "historicalReceipts":historical_receipts,
             }
-        )
+        ),
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -1245,13 +1398,59 @@ async def finalize_verification(
         summary["bankStatementAnalysisStatus"] = latest.get(
             "bankStatementAnalysisStatus", "NOT_AVAILABLE"
         )
+        final_documents_by_id = {
+            str(document.get("_id") or ""): document for document in documents
+        }
+        for document_id, analysis in list(bank_analyses_by_document.items()):
+            document = final_documents_by_id.get(document_id)
+            if document:
+                bank_analyses_by_document[document_id] = {
+                    **analysis,
+                    **calculate_bank_score_assessment(
+                        document,
+                        analysis,
+                        customer,
+                        requirement_maximum=_requirement_points(
+                            requirements_by_id.get(
+                                str(document.get("requirementId") or ""),
+                                {},
+                            ),
+                            requirements,
+                        ),
+                    ),
+                }
         summary["bankStatementScore"] = [
             {
                 "documentId": document_id,
                 "score": analysis.get("bankStatementScore"),
+                **(
+                    calculate_bank_score_assessment(
+                        final_documents_by_id[document_id],
+                        analysis,
+                        customer,
+                        requirement_maximum=_requirement_points(
+                            requirements_by_id.get(
+                                str(
+                                    final_documents_by_id[document_id].get(
+                                        "requirementId"
+                                    )
+                                    or ""
+                                ),
+                                {},
+                            ),
+                            requirements,
+                        ),
+                    )
+                    if document_id in final_documents_by_id
+                    else {}
+                ),
                 "financialRequirementStatus": analysis.get(
                     "financialRequirementStatus"
                 ),
+                "minimumBalanceAssessment": analysis.get(
+                    "minimumBalanceAssessment"
+                ),
+                "monthlyBalanceChecks": analysis.get("monthlyBalanceChecks") or [],
             }
             for document_id, analysis in bank_analyses_by_document.items()
         ]

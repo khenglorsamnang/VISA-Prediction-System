@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
+BANK_STATEMENT_MAX_FILE_SIZE = 50 * 1024 * 1024
+
 
 def _csv_values(value: str) -> tuple[str, ...]:
     return tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())

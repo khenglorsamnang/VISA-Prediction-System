@@ -211,13 +211,33 @@ def create_receipt_pdf(
         story.append(Paragraph("Bank Statement Financial Checks", section_style))
         for item in bank_documents:
             analysis = item["bankStatementAnalysis"]
-            score = analysis.get("bankStatementScore") or {}
+            score = (
+                analysis.get("computedBankScore")
+                or analysis.get("bankStatementScore")
+                or {}
+            )
+            raw_components = score.get("components") or {}
+            score_components = (
+                {str(component.get("key")): component for component in raw_components}
+                if isinstance(raw_components, list)
+                else raw_components
+            )
+            score_percentage = score.get("percentage")
+            score_label = (
+                f"{float(score.get('points')):.2f} / {float(score.get('maximum', 45)):g}"
+                + (
+                    f" ({float(score_percentage):.2f}%)"
+                    if score_percentage is not None
+                    else ""
+                )
+                if score.get("available")
+                else f"Unavailable/{score.get('maximum', 45)}"
+            )
             story.append(
                 Paragraph(
                     (
                         f"<b>{escape(str(item.get('fileName') or 'Bank statement'))}</b> - "
-                        f"Score: {escape(str(score.get('points') if score.get('available') else 'Unavailable'))}/"
-                        f"{escape(str(score.get('maximum', 50)))} - "
+                        f"Current calculated score: {escape(score_label)} - "
                         f"Three-month requirement: "
                         f"{escape(str(analysis.get('financialRequirementStatus') or 'INSUFFICIENT_DATA'))} - "
                         f"Authenticity: not confirmed"
@@ -225,64 +245,81 @@ def create_receipt_pdf(
                     styles["BodyText"],
                 )
             )
-            monthly_rows = [
-                [
-                    "Month",
-                    "Opening",
-                    "Closing",
-                    "Minimum",
-                    "Difference",
-                    "Status",
-                ]
-            ]
-            monthly_history = {
-                str(entry.get("month") or ""): entry
-                for entry in analysis.get("monthlyBalanceHistory") or []
-                if isinstance(entry, dict)
+            component_rows = [["Scoring component", "Points"]]
+            component_names = {
+                "ending_balance": "Ending Balance",
+                "starting_balance": "Starting Balance",
+                "transaction_history": "Transaction History",
+                "transaction_period": "Transaction Period",
             }
-            for check in analysis.get("monthlyBalanceChecks") or []:
-                history = monthly_history.get(str(check.get("month") or ""), {})
-                monthly_rows.append(
+            for key, label in component_names.items():
+                component = score_components.get(key) or {}
+                points = component.get("points")
+                maximum = component.get("maximum", 0)
+                component_rows.append(
                     [
-                        check.get("month") or "—",
+                        label,
                         (
-                            f"{history.get('openingBalance')} {history.get('currency') or ''}"
-                            if history.get("openingBalance") is not None
-                            else "—"
+                            f"{float(points):.2f} / {float(maximum):.2f}"
+                            if points is not None
+                            else f"Unavailable / {float(maximum):.2f}"
                         ),
-                        (
-                            f"{check.get('closingBalance')} {check.get('currency') or ''}"
-                            if check.get("closingBalance") is not None
-                            else "—"
-                        ),
-                        (
-                            f"{check.get('minimumRequired')} USD"
-                            if check.get("minimumRequired") is not None
-                            else "—"
-                        ),
-                        (
-                            f"{check.get('differenceFromMinimum')} USD"
-                            if check.get("differenceFromMinimum") is not None
-                            else "—"
-                        ),
-                        check.get("status") or "INSUFFICIENT_DATA",
                     ]
                 )
-            if len(monthly_rows) > 1:
-                story.append(
-                    _styled_table(
-                        monthly_rows,
-                        [0.85, 1.0, 1.1, 1.0, 1.0, 1.1],
-                    )
+            story.append(_styled_table(component_rows, [3.7, 2.3]))
+            confirmed_score = analysis.get("confirmedBankScore") or {}
+            audit = (
+                score.get("sourceReviewDeductionAudit")
+                if isinstance(score, dict)
+                else None
+            )
+            confirmed_label = (
+                f"{float(confirmed_score.get('points')):.2f} / {float(confirmed_score.get('maximum', 45)):.2f}"
+                if confirmed_score.get("status") == "CONFIRMED"
+                else "Not yet confirmed"
+            )
+            story.append(
+                Paragraph(
+                    f"Confirmed score: {escape(confirmed_label)}",
+                    small_style,
                 )
-            else:
+            )
+            if isinstance(audit, dict):
+                unverified_count = int(audit.get("unverifiedTransactionCount") or 0)
+                deduction = float(audit.get("totalDeductionPoints") or 0)
+                history_current = float(
+                    audit.get("transactionHistoryCurrentPoints")
+                    if audit.get("transactionHistoryCurrentPoints") is not None
+                    else 0
+                )
+                history_base = float(
+                    audit.get("transactionHistoryBasePoints")
+                    if audit.get("transactionHistoryBasePoints") is not None
+                    else 9
+                )
                 story.append(
                     Paragraph(
-                        "Three complete months of explicit USD closing-balance evidence were not available.",
+                        (
+                            f"Source review audit: {unverified_count} UNVERIFIED transactions "
+                            f"× 0.50 = −{deduction:.2f} points; "
+                            f"Transaction History = {history_current:.2f} / {history_base:.2f}"
+                        ),
                         small_style,
                     )
                 )
-            flags = analysis.get("riskFlags") or []
+            if not _append_monthly_balance_table(story, analysis):
+                story.append(
+                    Paragraph(
+                        "Monthly closing balances are supporting information; the score uses the complete period boundaries and transactions.",
+                        small_style,
+                    )
+                )
+            flags = [
+                flag
+                for flag in analysis.get("riskFlags") or []
+                if isinstance(flag, dict)
+                and flag.get("code") != "PERIOD_END_BALANCE_BELOW_REQUIRED"
+            ]
             if flags:
                 story.append(
                     Paragraph(
@@ -507,7 +544,7 @@ def _append_aba_evidence(story: list[Any], report: dict[str, Any], section_style
         story.append(_styled_table([
             ["Statement strength", f"{_display(strength)} / 10" if strength is not None else "Unavailable", "Normalized quality (0-1)", _display(analysis.get("normalizedQuality"))],
             ["Review status", analysis.get("reviewStatus"), "Reconciliation", analysis.get("reconciliationStatus")],
-            ["Owner relationship", analysis.get("ownerRelationship"), "Ownership confirmed", "Yes" if analysis.get("ownerRelationshipConfirmed") else "No"],
+            ["Account holder (extracted)", statement.get("holder") or "Not extracted", "Account ownership", "Not asserted"],
             ["Period start", statement.get("start"), "Period end", statement.get("end")],
             ["Average daily posted balance", _minor_amount(metrics.get("average"), currency), "Ending posted balance", _minor_amount(metrics.get("ending", statement.get("ending")), currency)],
             ["Money in", _minor_amount(metrics.get("money_in", metrics.get("total_in")), currency), "Money out", _minor_amount(metrics.get("money_out", metrics.get("total_out")), currency)],
@@ -544,18 +581,144 @@ def _append_aba_evidence(story: list[Any], report: dict[str, Any], section_style
             "Authenticity is not verified. " + escape(_display(analysis.get("availableBalance"), "Posted balances may exclude holds and pending withdrawals; spendable balance is unknown.")),
             small_style,
         ))
+        financial_analysis = item.get("bankStatementAnalysis")
+        if isinstance(financial_analysis, dict):
+            score = (
+                financial_analysis.get("computedBankScore")
+                or financial_analysis.get("bankStatementScore")
+                or {}
+            )
+            _append_monthly_balance_table(story, financial_analysis)
+
+
+def _append_monthly_balance_table(story: list[Any], analysis: dict[str, Any]) -> bool:
+    monthly_rows = [["Month", "Closing balance", "Evidence status", "Source"]]
+    monthly_history = {
+        str(entry.get("month") or ""): entry
+        for entry in analysis.get("monthlyBalanceHistory") or []
+        if isinstance(entry, dict)
+    }
+    monthly_summary = {
+        str(entry.get("month") or ""): entry
+        for entry in (analysis.get("transactionSummary") or {}).get("monthly", [])
+        if isinstance(entry, dict)
+    }
+    monthly_checks = {
+        str(entry.get("month") or ""): entry
+        for entry in analysis.get("monthlyBalanceChecks") or []
+        if isinstance(entry, dict)
+    }
+    months = sorted(set(monthly_history) | set(monthly_summary) | set(monthly_checks))
+    for month in months:
+        check = monthly_checks.get(month, {})
+        history = monthly_history.get(month, {})
+        summary = monthly_summary.get(month, {})
+        closing_balance = next(
+            (
+                entry.get("closingBalance")
+                for entry in (check, summary, history)
+                if entry.get("closingBalance") is not None
+            ),
+            None,
+        )
+        currency = (
+            check.get("currency")
+            or summary.get("currency")
+            or history.get("currency")
+            or ""
+        )
+        source_parts = []
+        if check.get("sourcePage") or summary.get("sourcePage"):
+            source_parts.append(
+                f"Page {check.get('sourcePage') or summary.get('sourcePage')}"
+            )
+        if check.get("sourceTransaction") or summary.get("sourceTransaction"):
+            source_parts.append(
+                f"ref {check.get('sourceTransaction') or summary.get('sourceTransaction')}"
+            )
+        if check.get("sourceDate") or summary.get("sourceDate"):
+            source_parts.append(
+                str(check.get("sourceDate") or summary.get("sourceDate"))
+            )
+        if not source_parts:
+            source_parts.append(
+                str(check.get("source") or summary.get("closingBalanceSource") or "Source unavailable")
+            )
+        minimum_status = (
+            check.get("minimumBalanceStatus")
+            or summary.get("minimumBalanceStatus")
+        )
+        minimum_required = (
+            check.get("minimumRequired")
+            if check.get("minimumRequired") is not None
+            else summary.get("minimumRequired")
+        )
+        shortfall = (
+            check.get("shortfall")
+            if check.get("shortfall") is not None
+            else summary.get("shortfall")
+        )
+        if minimum_status == "BELOW_MINIMUM":
+            closing_display = (
+                "Below minimum - manual review; "
+                f"Closing balance: {_major_amount(closing_balance, currency)}; "
+                f"Minimum: {_major_amount(minimum_required, 'USD')}; "
+                f"Shortfall: {_major_amount(shortfall, 'USD')}"
+            )
+        elif closing_balance is None:
+            closing_display = "Balance unavailable"
+        else:
+            closing_display = _major_amount(closing_balance, currency)
+        monthly_rows.append(
+            [
+                month or "—",
+                closing_display,
+                check.get("status")
+                or summary.get("closingBalanceStatus")
+                or ("AVAILABLE" if closing_balance is not None else "INSUFFICIENT_DATA"),
+                " · ".join(source_parts),
+            ]
+        )
+    if len(monthly_rows) <= 1:
+        return False
+    story.append(_styled_table(monthly_rows, [0.8, 3.5, 1.2, 1.7]))
+    return True
+
+
+def _major_amount(value: Any, currency: str) -> str:
+    if value is None or isinstance(value, bool):
+        return "Unavailable"
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return "Unavailable"
+    if not amount.is_finite():
+        return "Unavailable"
+    return f"{currency} {amount:,.2f}".strip()
 
 
 def _canonical_document_points(item: dict[str, Any], summary: dict[str, Any], awarded_documents: set[str]) -> str:
     document_id = str(item.get("documentId") or "")
+    calculated_label = None
+    bank_analysis = item.get("bankStatementAnalysis")
+    if isinstance(bank_analysis, dict):
+        bank_score = bank_analysis.get("computedBankScore") or bank_analysis.get("bankStatementScore") or {}
+        if bank_score.get("available") and bank_score.get("points") is not None:
+            maximum = bank_score.get("maximum", 45)
+            calculated_label = (
+                f"Current calculated score: {_display(bank_score.get('points'))} / "
+                f"{_display(maximum)}"
+            )
     slots = [slot for slot in summary.get("requirementScores") or [] if isinstance(slot, dict)]
     selected = next((slot for slot in slots if str(slot.get("selectedDocumentId") or "") == document_id and document_id), None)
     related = selected or next((slot for slot in slots if document_id in [str(value) for value in slot.get("documentIds") or []] or str(item.get("requirementId") or "") in [str(slot.get("requirementId") or ""), *[str(value) for value in slot.get("alternativeRequirementIds") or []]]), {})
     maximum = _display(related.get("maximumEarnedPoints", related.get("configuredPoints")))
     if not selected or document_id in awarded_documents:
-        return f"Points: 0 / {maximum} - Not selected; no additional award"
+        result = f"Points: 0 / {maximum} - Not selected; no additional award"
+        return f"{calculated_label} - {result}" if calculated_label else result
     awarded_documents.add(document_id)
-    return f"Points: {_display(selected.get('exactEarnedPoints', selected.get('earnedPoints')))} / {maximum} - Canonical ledger contribution"
+    result = f"Points: {_display(selected.get('exactEarnedPoints', selected.get('earnedPoints')))} / {maximum} - Canonical ledger contribution"
+    return f"{calculated_label} - {result}" if calculated_label else result
 
 
 def _styled_table(rows: list[list[Any]], widths: list[float]) -> Table:

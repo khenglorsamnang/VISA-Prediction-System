@@ -13,7 +13,7 @@ def _completed_document(**values):
     }
 
 
-def test_document_metrics_exclude_optional_and_missing_requirements_from_points():
+def test_document_metrics_include_optional_maximum_and_only_verified_points():
     summary = summarize_documents(
         [
             {"requirementId": "passport", "name": "Passport", "required": True, "weight": 60},
@@ -42,9 +42,9 @@ def test_document_metrics_exclude_optional_and_missing_requirements_from_points(
     assert summary["verifiedDocuments"] == 1
     assert summary["failedDocuments"] == 1
     assert summary["verificationPercentage"] == 50
-    assert summary["totalAvailablePoints"] == 100
-    assert summary["verifiedPoints"] == 45
-    assert summary["documentReadiness"] == 45
+    assert summary["totalAvailablePoints"] == 110
+    assert summary["verifiedPoints"] == 60
+    assert summary["documentReadiness"] == 54.55
     assert summary["missingRequiredDocuments"] == []
     assert summary["ocrProgress"] == {
         "pagesProcessed": 3,

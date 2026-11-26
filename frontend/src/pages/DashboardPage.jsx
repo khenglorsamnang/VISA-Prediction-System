@@ -489,22 +489,6 @@ export function DashboardPage({ profile = {} }) {
                         <p className="mt-0.5 text-xs text-slate-500">
                           {application.applicationNumber || "—"}
                         </p>
-                        {application.documentVerification?.map((document) => (
-                          <p
-                            key={document.documentId}
-                            className="mt-1 text-[11px] text-slate-600"
-                          >
-                            {document.requirementName}:{" "}
-                            <span className="font-medium">
-                              {document.score?.points ?? 0} /{" "}
-                              {document.score?.maximum ?? 0} points
-                            </span>
-                            {" · "}
-                            <span className="font-semibold">
-                              {document.status}
-                            </span>
-                          </p>
-                        ))}
                       </td>
                       <td className="px-4 py-3 text-xs font-medium text-blue-800">
                         {getVisaTypeCode(application) ||

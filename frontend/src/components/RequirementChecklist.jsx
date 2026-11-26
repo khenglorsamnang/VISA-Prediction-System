@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertCircle, CheckCircle2, FileText } from "lucide-react";
 import FileUpload from "./FileUpload";
+import { getRequirementMaxFileSize } from "../pages/pageUtils";
 
 /** Reusable requirements checklist; callers supply data and document actions. */
 export default function RequirementChecklist({
@@ -46,10 +47,18 @@ export default function RequirementChecklist({
           "png",
         ];
         const isChecked = checkedOverrides[id] ?? currentFiles.length > 0;
-        const maxFileSize = requirement.maxFileSize || 10 * 1024 * 1024;
+        const maxFileSize = getRequirementMaxFileSize(requirement);
         const isComplete = currentFiles.some(
           (file) => String(file.status || "").toUpperCase() !== "REJECTED",
         );
+        const bankAnalysis = currentDocument?.bankStatementAnalysis;
+        const bankScore =
+          bankAnalysis?.computedBankScore ?? bankAnalysis?.bankStatementScore;
+        const bankScoreAvailable =
+          bankScore?.available &&
+          bankScore.points != null &&
+          Number.isFinite(Number(bankScore.points)) &&
+          Number(bankScore.maximum) > 0;
         return (
           <article
             key={id}
@@ -166,8 +175,20 @@ export default function RequirementChecklist({
                     </p>
                     <p className="mt-1 text-slate-700">
                       Score:{" "}
-                      {isBankStatement && currentDocument.bankStatementAnalysis?.bankStatementScore?.available
-                        ? `${currentDocument.bankStatementAnalysis.bankStatementScore.points} / ${currentDocument.bankStatementAnalysis.bankStatementScore.maximum} points`
+                      {isBankStatement
+                        ? bankScoreAvailable
+                          ? t("bankScore", {
+                              points: Number(bankScore.points).toFixed(2),
+                              maximum: bankScore.maximum,
+                              percentage: (
+                                (Number(bankScore.points) /
+                                  Number(bankScore.maximum)) *
+                                100
+                              ).toFixed(2),
+                            })
+                          : t("bankScoreUnavailable", {
+                              maximum: bankScore?.maximum ?? 45,
+                            })
                         : `${currentDocument.awardedPoints ?? 0} / ${Number(requirement.weight ?? requirement.points ?? 0)} points`}
                     </p>
                     {currentDocument.automatedVerification && (

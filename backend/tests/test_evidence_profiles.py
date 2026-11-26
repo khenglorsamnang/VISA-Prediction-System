@@ -58,7 +58,9 @@ def test_minimum_not_awarded_for_unknown_or_unverified():
     assert assess(profile,[bank(None)])["earnedPoints"]==0
     assert assess(profile,[bank(7,reviewStatus="PENDING_REVIEW")])["earnedPoints"]==0
     assert assess(profile,[bank(7,reconciliationStatus="NEEDS_REVIEW")])["earnedPoints"]==0
-    assert assess(profile,[bank(7,ownerRelationshipConfirmed=False)])["earnedPoints"]==0
+    assert assess(profile,[bank(7,ownerRelationshipConfirmed=False)])["earnedPoints"]==21.67
+    score=next(item for item in assess(profile,[bank(7,ownerRelationshipConfirmed=False)])["requirementScores"] if item["requirementId"]=="bank")
+    assert score["earnedPoints"]==21.67
 
 
 def test_confirmed_verification_is_distinct_from_completeness():
@@ -139,18 +141,19 @@ def test_aggregate_rounding_idempotency_and_fingerprint_invalidation():
     assert assess(profile,docs)["inputFingerprint"]!=result["inputFingerprint"]
 
 
-@pytest.mark.parametrize("bad",["NaN","Infinity",-1,101,True])
+@pytest.mark.parametrize("bad",["NaN","Infinity",-1,0,True])
 def test_invalid_allocations_rejected(bad):
     with pytest.raises(ValueError):normalize_scoring_fields({"weight":bad})
 
 
 def test_budget_alias_official_sources_and_branches_validated():
-    with pytest.raises(ValueError,match="exactly 100"):validate_profile_requirements([requirement("a",99)])
+    assert validate_profile_requirements([requirement("a",99)])[0]["weight"] == 99
     with pytest.raises(ValueError,match="alias"):normalize_scoring_fields({"weight":10,"maximumEarnedPoints":20})
     with pytest.raises(ValueError,match="source"):validate_profile_requirements([requirement("a",100,sourceKind="OFFICIAL")])
     with pytest.raises(ValueError,match="alternative"):validate_profile_requirements([requirement("a",100,applicabilityRule={"field":"work","value":"employee"})])
     invalid=assess([requirement("a",99)],[])
-    assert not invalid["configurationValid"] and invalid["approvalProbability"] is None
+    assert invalid["configurationValid"] and invalid["maximumPoints"] == 99
+    assert invalid["approvalProbability"] is None
 
 
 class Cursor:
@@ -213,17 +216,20 @@ def test_profile_publication_atomic_snapshot_immutable_and_reassessment():
     asyncio.run(scenario())
 
 
-def test_bad_draft_cannot_publish_and_future_release_not_selected():
+def test_dynamic_budget_profile_publishes_and_future_release_is_not_selected():
     async def scenario():
         db=Database();await db['visatypes'].insert_one({'_id':'visa','countryId':'country'})
-        response=await api.create_profile({'name':'Bad budget','visaTypeId':'visa','requirements':[requirement('a',99)]},db,{'id':'admin'})
+        response=await api.create_profile({'name':'Dynamic budget','visaTypeId':'visa','requirements':[requirement('a',99)]},db,{'id':'admin'})
         draft=json.loads(response.body)['profile']
-        with pytest.raises(APIError):await api.publish_profile(draft['_id'],{'revision':1,'reason':'Attempt publish'},db,{'id':'admin'})
-        assert len(db['evidencepolicyprofiles'].rows)==1
-        response=await api.create_profile({'name':'Future','visaTypeId':'visa','requirements':bank_profile(),'effectiveFrom':'2099-01-01'},db,{'id':'admin'})
+        published=await api.publish_profile(draft['_id'],{'revision':1,'reason':'Publish dynamic budget'},db,{'id':'admin'})
+        published_profile=json.loads(published.body)['profile']
+        assert published_profile['requirements'][0]['weight'] == 99
+        assert len(db['evidencepolicyprofiles'].rows)==2
+        assert (await application_profile_fields(db,'visa'))['policyVersionId']==published_profile['_id']
+        response=await api.create_profile({'name':'Future','visaTypeId':'visa','requirements':bank_profile(),'version':'2','effectiveFrom':'2099-01-01'},db,{'id':'admin'})
         future=json.loads(response.body)['profile']
         await api.publish_profile(future['_id'],{'revision':1,'reason':'Schedule future release'},db,{'id':'admin'})
-        assert await application_profile_fields(db,'visa')=={}
+        assert (await application_profile_fields(db,'visa'))['policyVersionId']==published_profile['_id']
     asyncio.run(scenario())
 
 
@@ -344,20 +350,20 @@ def test_effective_profile_read_exposes_only_current_published_snapshot_to_custo
         assert client.get("/api/policy-profiles/effective/visa-type/visa").json()=={"profile":None}
 
 
-def test_application_creation_uses_published_requirements_after_live_rows_change_or_archive():
+def test_application_creation_uses_latest_requirements_not_policy_profiles():
     from backend.app.api.visa_types import create_application
     async def scenario():
         db=Database()
         await db["customers"].insert_one({"_id":"customer","fullName":"Synthetic applicant"})
         await db["visatypes"].insert_one({"_id":"visa","countryId":"country","active":True,"name":"Visitor"})
-        published={"_id":"release","name":"Reviewed policy","version":"1","visaTypeId":"visa","countryId":"country","status":"PUBLISHED","scoringVersion":"evidence-v3","requirements":bank_profile(),"effectiveFrom":"2026-01-01","timezone":"Asia/Phnom_Penh","publishedAt":datetime(2026,1,1,tzinfo=timezone.utc)}
-        await db["evidencepolicyprofiles"].insert_one(published)
         await db["visarequirements"].insert_one({"_id":"changed","visaTypeId":"visa","status":"ACTIVE","weight":1,"name":"Changed live row"})
         first=json.loads((await create_application({"customer":"customer","visaTypeId":"visa"},db)).body)["application"]
-        assert first["policyVersionId"]=="release"
-        assert first["requirementSnapshot"]==bank_profile()
-        db["visarequirements"].rows[0]["status"]="ARCHIVED"
+        assert first["requirementSnapshot"][0]["requirementId"]=="changed"
+        assert first["requirementSnapshot"][0]["weight"]==1
+        assert "evidencePolicySnapshot" not in first
+        assert "policyVersionId" not in first
+        db["visarequirements"].rows[0]["weight"]=2
         second=json.loads((await create_application({"customer":"customer","visaTypeId":"visa"},db)).body)["application"]
-        assert second["requirementSnapshot"]==bank_profile()
-        assert second["evidencePolicySnapshot"]==first["evidencePolicySnapshot"]
+        assert second["requirementSnapshot"][0]["weight"]==2
+        assert first["requirementSnapshot"][0]["weight"]==1
     asyncio.run(scenario())

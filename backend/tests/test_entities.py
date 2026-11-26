@@ -15,12 +15,14 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from backend.app import main
 from backend.app.api import (
+    bank_statements as bank_statements_api,
     dependencies,
     documents as documents_api,
     document_workflow as document_workflow_api,
     ml as ml_api,
     verification_reports as verification_reports_api,
 )
+from backend.app.services.bank_statement_scoring import calculate_bank_statement_score
 
 TEST_JWT_SECRET = "fastapi-entity-test-secret-with-32-bytes"
 
@@ -848,7 +850,7 @@ def test_visa_type_and_requirements_save_together_or_roll_back(
                 "acceptedFormats": ["jpg", "jpeg", "png"],
                 "maxFileSize": 5_000_000,
                 "status": "ACTIVE",
-                "weight": 20,
+                "weight": 100,
                 "displayOrder": 0,
             },
             {
@@ -913,10 +915,135 @@ def test_visa_type_and_requirements_save_together_or_roll_back(
     saved_requirements = saved.json()["requirements"]
     assert len(saved_requirements) == 2
     assert set(saved_requirements[0]["acceptedFormats"]) == {"jpg", "jpeg", "png"}
+    assert saved_requirements[0]["weight"] == 100
     assert set(saved_requirements[1]["acceptedFormats"]) == {"pdf", "jpg", "jpeg", "png"}
     assert saved_requirements[1]["required"] is False
     assert saved_requirements[1]["maxFileSize"] == 10_000_000
     assert saved_requirements[1]["status"] == "INACTIVE"
+
+
+def test_requirement_versions_preserve_application_snapshot_until_admin_recalculation(
+    entity_client: tuple[TestClient, FakeDatabase],
+) -> None:
+    client, database = entity_client
+    headers = _headers("ADMIN")
+    database["visatypes"].documents.append(
+        {
+            "_id": "requirements-visa",
+            "name": "Visitor",
+            "active": True,
+            "requirementsConfigurationVersion": 0,
+        }
+    )
+    database["customers"].documents.append(
+        {"_id": "requirements-customer", "fullName": "Snapshot Applicant"}
+    )
+
+    created = client.post(
+        "/api/requirements",
+        headers=headers,
+        json={
+            "visaTypeId": "requirements-visa",
+            "name": "Passport",
+            "code": "passport",
+            "weight": 50,
+            "required": True,
+            "acceptedFormats": ["pdf", "jpg", "jpeg", "png"],
+        },
+    )
+    assert created.status_code == 201
+    requirement_id = created.json()["requirement"]["_id"]
+    assert created.json()["requirement"]["configurationVersion"] == 1
+
+    duplicate_name = client.post(
+        "/api/requirements",
+        headers=headers,
+        json={
+            "visaTypeId": "requirements-visa",
+            "name": "Passport",
+            "code": "travel_document",
+            "weight": 10,
+        },
+    )
+    duplicate_code = client.post(
+        "/api/requirements",
+        headers=headers,
+        json={
+            "visaTypeId": "requirements-visa",
+            "name": "Travel document",
+            "code": "passport",
+            "weight": 10,
+        },
+    )
+    assert duplicate_name.status_code == 409
+    assert duplicate_code.status_code == 409
+
+    application_response = client.post(
+        "/api/visa-types/applications",
+        headers=headers,
+        json={
+            "customerId": "requirements-customer",
+            "visaTypeId": "requirements-visa",
+        },
+    )
+    assert application_response.status_code == 201
+    application = application_response.json()["application"]
+    application_id = application["_id"]
+    assert application["requirementSnapshot"][0]["weight"] == 50
+    assert application["requirementsConfigurationVersion"] == 1
+
+    database["documents"].documents.append(
+        {
+            "_id": "requirements-passport",
+            "applicationId": application_id,
+            "requirementId": requirement_id,
+            "status": "VERIFIED",
+            "ocrStatus": "success",
+        }
+    )
+    changed = client.put(
+        f"/api/requirements/{requirement_id}",
+        headers=headers,
+        json={"weight": 60},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["requirement"]["configurationVersion"] == 2
+    assert database["visaapplications"].documents[0]["requirementSnapshot"][0][
+        "weight"
+    ] == 50
+
+    history = client.get(
+        f"/api/requirements/{requirement_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    versions = history.json()["history"]
+    assert [item["action"] for item in reversed(versions)] == ["CREATE", "UPDATE"]
+    assert versions[0]["adminId"] == "test-user"
+    assert versions[0]["previous"]["weight"] == 50
+    assert versions[0]["current"]["weight"] == 60
+
+    blocked = client.post(
+        f"/api/requirements/applications/{application_id}/recalculate",
+        headers=_headers("STAFF"),
+        json={"reason": "Recalculate updated requirements"},
+    )
+    assert blocked.status_code == 403
+    recalculated = client.post(
+        f"/api/requirements/applications/{application_id}/recalculate",
+        headers=headers,
+        json={"reason": "Recalculate updated requirements"},
+    )
+    assert recalculated.status_code == 200
+    updated = database["visaapplications"].documents[0]
+    assert updated["requirementSnapshot"][0]["weight"] == 60
+    assert updated["requirementsConfigurationVersion"] == 2
+    assert updated["maximumPoints"] == 60
+    assert updated["earnedPoints"] == 60
+    audit = updated["requirementRecalculationHistory"][0]
+    assert audit["reviewedBy"] == "test-user"
+    assert audit["previousRequirementSnapshot"][0]["weight"] == 50
+    assert audit["requirementSnapshot"][0]["weight"] == 60
 
 
 def test_application_list_shows_metrics_only_after_verification(
@@ -1009,7 +1136,7 @@ def test_application_list_shows_metrics_only_after_verification(
     )
     updated_application = updated_response.json()["applications"][0]
     assert updated_application["hasVerificationResult"] is True
-    assert updated_application["documentReadiness"] == 37.5
+    assert updated_application["documentReadiness"] == 62.5
     assert updated_application["verificationPercentage"] == 50
     assert "provisionalStatus" not in updated_application
     dashboard = client.get("/api/dashboard", headers=_headers("STAFF"))
@@ -1130,6 +1257,57 @@ def test_dashboard_resolves_customer_id_and_visa_details_from_live_records(
     assert application["visaTypeCode"] == "VISA-TOURIST"
 
 
+def test_dashboard_bank_score_uses_canonical_computed_score_not_awarded_points(
+    entity_client: tuple[TestClient, FakeDatabase],
+) -> None:
+    client, database = entity_client
+    application_id = "dashboard-bank-score-application"
+    components = {
+        "ending_balance": {"points": 7.88, "maximum": 22.5, "available": True},
+        "starting_balance": {"points": 6.66, "maximum": 6.75, "available": True},
+        "transaction_history": {"points": 8.75, "maximum": 9.0, "available": True},
+        "transaction_period": {"points": 6.75, "maximum": 6.75, "available": True},
+    }
+    bank_score = calculate_bank_statement_score(components)
+    bank_score["points"] = 0
+    database["visaapplications"].documents.append(
+        {
+            "_id": application_id,
+            "status": "UNDER_VERIFICATION",
+            "requirementSnapshot": [
+                {
+                    "requirementId": "dashboard-bank-requirement",
+                    "code": "bank_statement",
+                    "name": "Bank Statement",
+                    "weight": 45,
+                }
+            ],
+        }
+    )
+    database["documents"].documents.append(
+        {
+            "_id": "dashboard-bank-document",
+            "applicationId": application_id,
+            "requirementId": "dashboard-bank-requirement",
+            "requirementCode": "bank_statement",
+            "status": "VERIFIED",
+            "awardedPoints": 0,
+            "bankStatementAnalysis": {
+                "financialRequirementStatus": "PASS",
+                "bankStatementScore": bank_score,
+            },
+        }
+    )
+
+    response = client.get("/api/dashboard", headers=_headers("STAFF"))
+
+    assert response.status_code == 200
+    score = response.json()["recentApplications"][0]["documentVerification"][0][
+        "score"
+    ]
+    assert score == {"points": 30.04, "maximum": 45}
+
+
 def test_admin_user_list_returns_real_accounts_without_password_fields(
     entity_client: tuple[TestClient, FakeDatabase],
 ) -> None:
@@ -1211,7 +1389,7 @@ def test_verification_honors_justified_conditional_exceptions(
 
     assert response.status_code == 200
     verification = response.json()["verification"]
-    assert verification["status"] == "VERIFIED"
+    assert verification["status"] == "READY_FOR_STAFF_REVIEW"
     assert verification["completenessScore"] == 100
     assert verification["totalPoints"] == 70
     assert verification["earnedPoints"] == 70
@@ -1239,8 +1417,8 @@ def test_verification_recalculates_and_saves_score_from_current_document_statuse
                     "weight": 60,
                 },
                 {
-                    "requirementId": "bank-statement",
-                    "name": "Bank statement",
+                    "requirementId": "income-letter",
+                    "name": "Income letter",
                     "required": True,
                     "weight": 40,
                 },
@@ -1260,7 +1438,7 @@ def test_verification_recalculates_and_saves_score_from_current_document_statuse
             {
                 "_id": "statement-document",
                 "applicationId": "application-1",
-                "requirementId": "bank-statement",
+                "requirementId": "income-letter",
                 "status": "PENDING",
                 "ocrStatus": "manual_review",
             },
@@ -1277,7 +1455,7 @@ def test_verification_recalculates_and_saves_score_from_current_document_statuse
     assert first_verification["completenessScore"] == 60
     assert first_verification["totalPoints"] == 100
     assert first_verification["earnedPoints"] == 60
-    assert first_verification["status"] == "INSUFFICIENT_DATA"
+    assert first_verification["status"] == "NEEDS_REVIEW"
     assert first_verification["verificationMethod"] == "OCR_COMPLETENESS"
     assert "provisionalStatus" not in first_verification
     assert database["visaapplications"].documents[0]["completenessScore"] == 60
@@ -1295,7 +1473,7 @@ def test_verification_recalculates_and_saves_score_from_current_document_statuse
     assert second_verification["completenessScore"] == 100
     assert second_verification["totalPoints"] == 100
     assert second_verification["earnedPoints"] == 100
-    assert second_verification["status"] == "INSUFFICIENT_DATA"
+    assert second_verification["status"] == "READY_FOR_STAFF_REVIEW"
     assert database["visaapplications"].documents[0]["completenessScore"] == 100
     assert len(database["verifications"].documents) == 2
 
@@ -1352,7 +1530,7 @@ def test_ocr_completed_documents_get_immediate_check_without_staff_review(
 
     assert response.status_code == 200
     verification = response.json()["verification"]
-    assert verification["status"] == "INSUFFICIENT_DATA"
+    assert verification["status"] == "NEEDS_REVIEW"
     assert verification["completenessScore"] == 0
     assert verification["verificationPercentage"] == 0
     assert all(result["status"] == "INSUFFICIENT_DATA" for result in verification["results"])
@@ -1399,7 +1577,7 @@ def test_rejected_document_fails_verification_instead_of_appearing_missing(
 
     assert response.status_code == 200
     verification = response.json()["verification"]
-    assert verification["status"] == "REJECTED"
+    assert verification["status"] == "NEEDS_REVIEW"
     assert verification["results"][0]["status"] == "FAIL"
 
 
@@ -1805,6 +1983,223 @@ def test_manual_document_review_requires_a_reason_and_records_overrides(
     assert manual_override.status_code == 200
     assert document["status"] == "VERIFIED"
     assert len(document["manualReviewHistory"]) == 2
+
+
+def test_source_review_report_reload_uses_current_persisted_bank_score(
+    entity_client: tuple[TestClient, FakeDatabase],
+    monkeypatch,
+) -> None:
+    client, database = entity_client
+    application_id = "score-application"
+    document_id = "DOC-7D04FFD1525F"
+    requirement = {
+        "_id": "score-bank",
+        "requirementId": "score-bank",
+        "visaTypeId": "score-visa",
+        "name": "Bank statement",
+        "code": "bank_statement",
+        "status": "ACTIVE",
+        "required": True,
+        "weight": 45,
+    }
+    database["visaapplications"].documents.append(
+        {
+            "_id": application_id,
+            "customer": "test-user",
+            "visaType": "score-visa",
+            "applicationNumber": "VD-SCORE",
+            "requirementSnapshot": [requirement],
+        }
+    )
+    database["customers"].documents.append(
+        {"_id": "test-user", "fullName": "Test Applicant"}
+    )
+    database["visatypes"].documents.append(
+        {"_id": "score-visa", "name": "Visitor", "destination": "Australia"}
+    )
+    database["visarequirements"].documents.append(requirement)
+    transactions = [
+        {
+            "date": "2026-03-20",
+            "description": f"Wire transfer {index}",
+            "amount": 2000,
+            "type": "credit",
+            "direction": "credit",
+            "currency": "USD",
+            "balance": 6000 + index,
+            "page": 2,
+            "referenceNumber": f"WIRE-{index}",
+        }
+        for index in range(40)
+    ]
+    fields = {
+        "currency": "USD",
+        "statementStartDate": "2026-01-01",
+        "statementEndDate": "2026-03-31",
+        "transactionHistory": transactions,
+    }
+
+    def score_with_configured_source_penalty(_fields, **kwargs):
+        source_reviews = kwargs.get("transaction_source_reviews") or {}
+        configured_penalty = float(
+            kwargs["config"]["unverified_source_penalty_points"]
+        )
+        penalty = (
+            configured_penalty
+            if source_reviews.get("0", {}).get("status") == "UNVERIFIED"
+            else 0
+        )
+        components = {
+            "ending_balance": {"points": 7.88, "maximum": 22.5, "available": True},
+            "starting_balance": {"points": 6.66, "maximum": 6.75, "available": True},
+            "transaction_history": {
+                "points": 8.75 - penalty,
+                "maximum": 9.0,
+                "available": True,
+            },
+            "transaction_period": {"points": 6.75, "maximum": 6.75, "available": True},
+        }
+        score = calculate_bank_statement_score(components)
+        score.update(
+            {
+                "totalPenaltyPoints": penalty,
+                "transactionReviewRequirements": {
+                    "unverifiedSourcePenaltyPoints": configured_penalty,
+                    "maximumBankScore": 45,
+                },
+                "transactionReviews": [
+                    {
+                        "transactionIndex": index,
+                        "requiresStaffReview": True,
+                        "status": (
+                            "UNVERIFIED"
+                            if index == 0 and penalty
+                            else "PENDING_REVIEW"
+                        ),
+                        "amount": transaction["amount"],
+                        "currency": "USD",
+                        "amountUsd": 2000,
+                        "exchangeRateToUsd": 1,
+                        "staffReviewThresholdUsd": 1000,
+                        "reference": transaction["referenceNumber"],
+                        "sourceEvidence": "Statement transaction row",
+                        "evidenceReferences": [],
+                    }
+                    for index, transaction in enumerate(transactions)
+                ],
+            }
+        )
+        return {
+            "transactions": transactions,
+            "bankStatementScore": score,
+            "financialRequirementStatus": "PASS",
+            "reconciliation": {"status": "RECONCILED"},
+        }
+
+    monkeypatch.setattr(
+        bank_statements_api, "score_bank_statement", score_with_configured_source_penalty
+    )
+
+    async def skip_aba_invalidation(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bank_statements_api, "_invalidate_aba_case", skip_aba_invalidation)
+    pre_review_analysis = score_with_configured_source_penalty(
+        fields,
+        config={"unverified_source_penalty_points": 0.5},
+    )
+    database["documents"].documents.append(
+        {
+            "_id": document_id,
+            "applicationId": application_id,
+            "requirementId": "score-bank",
+            "requirementCode": "bank_statement",
+            "status": "NEEDS_REVIEW",
+            "ocrStatus": "OCR_COMPLETED",
+            "extractedFields": fields,
+            "bankStatementAnalysis": pre_review_analysis,
+        }
+    )
+
+    saved = client.post(
+        f"/api/bank-statements/documents/{document_id}/transactions/0/source-review",
+        headers=_headers("STAFF"),
+        json={"action": "SOURCE_UNVERIFIED", "sourceCategory": "UNKNOWN"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["bankStatementAnalysis"]["computedBankScore"]["points"] == 29.54
+    assert saved.json()["bankStatementAnalysis"]["bankStatementScore"]["pendingTransactionReviews"] == 39
+    assert saved.json()["bankStatementAnalysis"]["bankStatementScore"]["totalPenaltyPoints"] == 0.5
+    assert saved.json()["bankStatementAnalysis"]["sourceReviewStatus"] == "UNVERIFIED"
+
+    database["verifications"].documents.append(
+        {
+            "_id": "old-score-assessment",
+            "applicationId": application_id,
+            "createdAt": "2026-11-20T12:00:00Z",
+            "results": [
+                {
+                    "bankStatements": [
+                        {
+                            "documentId": document_id,
+                            "analysis": pre_review_analysis,
+                        }
+                    ]
+                }
+            ],
+        }
+    )
+    reloaded = client.get(
+        f"/api/verification/results/{application_id}",
+        headers=_headers("STAFF"),
+    )
+    assert reloaded.status_code == 200, reloaded.text
+    assert reloaded.headers["cache-control"] == "no-store"
+    report_score = next(
+        item
+        for item in reloaded.json()["summary"]["bankStatementScore"]
+        if item["documentId"] == document_id
+    )
+    report_document = next(
+        item
+        for item in reloaded.json()["documents"]
+        if item["documentId"] == document_id
+    )
+    detailed_score = report_document["bankStatementAnalysis"]
+    history = next(
+        item
+        for item in detailed_score["computedBankScore"]["components"]
+        if item["key"] == "transaction_history"
+    )
+    displayed_categories = {
+        item["key"]: item["points"]
+        for item in detailed_score["computedBankScore"]["components"]
+    }
+
+    assert report_score["computedBankScore"]["points"] == 29.54
+    assert report_score["requirementContribution"]["points"] == 29.54
+    assert report_score["computedBankScore"]["maximum"] == 45
+    assert report_score["score"]["points"] == report_score["computedBankScore"]["points"]
+    assert (
+        report_score["bankDiagnosticScore"]["points"]
+        == report_score["computedBankScore"]["points"]
+    )
+    assert displayed_categories == {
+        "ending_balance": 7.88,
+        "starting_balance": 6.66,
+        "transaction_history": 8.25,
+        "transaction_period": 6.75,
+    }
+    assert history["points"] == 8.25
+    assert sum(displayed_categories.values()) == 29.54
+    assert detailed_score["bankStatementScore"]["points"] == 29.54
+    assert detailed_score["computedBankScore"]["points"] == 29.54
+    assert detailed_score["requirementContribution"]["points"] == 29.54
+    assert detailed_score["bankStatementScore"]["pendingTransactionReviews"] == 39
+    assert detailed_score["confirmedBankScore"]["status"] == "NOT_YET_CONFIRMED"
+    assert detailed_score["staffReviewStatus"] == "PENDING_REVIEW"
+    assert detailed_score["documentReviewStatus"] == "PENDING_REVIEW"
+    assert detailed_score["authenticityStatus"] == "NOT_VERIFIED"
 
 
 def test_verification_results_are_customer_scoped_and_mask_passport(
